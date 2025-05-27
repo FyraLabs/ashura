@@ -3,6 +3,8 @@ name = "ashura-secsvc"
 version = "0.1.0"
 edition = "2024"
 description = "Freedesktop Secret Service implementation powered by Ashura"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/FyraLabs/ashura/tree/main/frontend"
 
 [dependencies]
 # todo: zbus and friends

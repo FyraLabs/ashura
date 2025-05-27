@@ -1,0 +1,13 @@
+[package]
+name = "tpm2-rand"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Cappy Ishihara <cappy@fyralabs.com>"]
+description = "A simple TPM2-based random number generator"
+repository = "https://github.com/FyraLabs/ashura/tree/main/crates/tpm2-rand"
+categories = ["api-bindings", "hardware-support", "os"]
+
+[dependencies]
+rand_core = ">=0.9"
+tss-esapi = ">=7"
