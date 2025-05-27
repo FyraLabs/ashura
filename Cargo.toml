@@ -1,0 +1,24 @@
+[package]
+name = "ashura"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "TPM-backed KV secret storage"
+repository = "https://github.com/FyraLabs/ashura"
+authors = [
+    "Cappy Ishihara <cappy@fyralabs.com>",
+]
+keywords = ["tpm", "kv", "secret", "storage"]
+
+[workspace]
+members = [
+    "frontend/"
+]
+
+[dependencies]
+bincode = { version = "2.0.1", features = ["serde"] }
+secrecy = { version = "0.10.3", features = ["serde"] }
+serde = { version = "1.0.219", features = ["derive"] }
+sled = "0.34.7"
+tss-esapi = "7.6.0"
+zeroize = { version = "1.8.1", features = ["derive", "simd"] }

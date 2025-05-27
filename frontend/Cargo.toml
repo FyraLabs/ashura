@@ -1,0 +1,8 @@
+[package]
+name = "ashura-secsvc"
+version = "0.1.0"
+edition = "2024"
+description = "Freedesktop Secret Service implementation powered by Ashura"
+
+[dependencies]
+# todo: zbus and friends
