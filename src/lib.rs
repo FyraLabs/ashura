@@ -1,8 +1,5 @@
 pub mod crypt;
-use aes_gcm::{
-    Aes256Gcm, Nonce,
-    aead::{Aead, AeadCore, KeyInit, OsRng},
-};
+use aes_gcm::{Aes256Gcm, aead::KeyInit};
 use hkdf::Hkdf;
 use secrecy::ExposeSecret;
 use secrecy::SecretSlice;
@@ -68,9 +65,10 @@ pub struct MasterKey {
 }
 
 impl MasterKey {
-    pub fn generate() -> Self {
+    pub fn generate(tpm_context: TpmContext) -> Self {
         // TODO: implement TpmRng
-        let mut ephemeral_key = Aes256Gcm::generate_key(&mut OsRng);
+        let mut tpm2_rng = tpm2_rand::TpmRand::new(tpm_context);
+        let mut ephemeral_key = Aes256Gcm::generate_key(&mut tpm2_rng);
         let key_vec = ephemeral_key.as_slice().to_vec();
         ephemeral_key.as_mut_slice().zeroize();
         Self {
@@ -82,11 +80,11 @@ impl MasterKey {
         &self.key
     }
 
-    pub fn unseal_from_ciphertxt(ciphertxt: &[u8], tpm_context: &TpmContext) -> Self {
+    pub fn unseal_from_ciphertxt(ciphertxt: &[u8], tpm_context: TpmContext) -> Self {
         todo!("Implement unsealing logic")
     }
 
-    pub fn seal_to_ciphertext(&self, tpm_context: &TpmContext) -> Vec<u8> {
+    pub fn seal_to_ciphertext(&self, tpm_context: TpmContext) -> Vec<u8> {
         todo!("Implement sealing logic")
     }
 }

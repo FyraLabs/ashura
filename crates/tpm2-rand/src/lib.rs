@@ -1,4 +1,4 @@
-use rand_core::RngCore;
+use rand_core::{CryptoRng, RngCore};
 use tss_esapi::Context;
 
 pub struct TpmRand {
@@ -50,7 +50,14 @@ impl RngCore for TpmRand {
             offset += chunk_size;
         }
     }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
 }
+
+impl CryptoRng for TpmRand {}
 
 #[cfg(test)]
 mod tests {

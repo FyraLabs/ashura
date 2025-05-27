@@ -1,6 +1,6 @@
 [package]
 name = "tpm2-rand"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Cappy Ishihara <cappy@fyralabs.com>"]
@@ -9,5 +9,5 @@ repository = "https://github.com/FyraLabs/ashura/tree/main/crates/tpm2-rand"
 categories = ["api-bindings", "hardware-support", "os"]
 
 [dependencies]
-rand_core = ">=0.9"
+rand_core = "0"
 tss-esapi = ">=7"

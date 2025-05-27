@@ -12,10 +12,10 @@ keywords = ["tpm", "kv", "secret", "storage"]
 members = ["crates/tpm2-rand", "frontend/"]
 
 [dependencies]
+tpm2-rand = { path = "crates/tpm2-rand" }
 aes-gcm = { version = "0.10.3", features = ["zeroize"] }
 bincode = { version = "2.0.1", features = ["serde"] }
 hkdf = "0.12.4"
-rand_core = "0.9.3"
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.219", features = ["derive"] }
 sha2 = "0.10.9"
