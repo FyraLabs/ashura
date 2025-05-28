@@ -1,7 +1,7 @@
+// use log::{debug, error, info, warn};
 use std::cell::RefCell;
+use std::convert::TryFrom;
 use tss_esapi::handles::KeyHandle;
-// Remove Digest as it's no longer used directly in create_with_primary with builders
-// use tss_esapi::structures::{Digest, RsaDecryptionScheme};
 use tss_esapi::structures::RsaDecryptionScheme; // Keep for rsa_encrypt/decrypt
 use tss_esapi::traits::Marshall;
 use tss_esapi::{handles::ObjectHandle, tcti_ldr::TabrmdConfig};
@@ -14,13 +14,13 @@ pub fn default_tcti_handle() -> tss_esapi::TctiNameConf {
 #[derive(Clone)]
 pub struct TpmObjectHandle {
     handle: ObjectHandle,
-    ctx: *mut tss_esapi::Context,
+    // ctx: *mut tss_esapi::Context, // Removed
 }
 
 impl TpmObjectHandle {
-    /// Creates a new `TpmObjectHandle` with the given handle and context.
-    pub fn new(handle: ObjectHandle, ctx: *mut tss_esapi::Context) -> Self {
-        Self { handle, ctx }
+    /// Creates a new `TpmObjectHandle` with the given handle.
+    pub fn new(handle: ObjectHandle /*, ctx: *mut tss_esapi::Context */) -> Self {
+        Self { handle, /*, ctx */ }
     }
 
     /// Returns the underlying TPM object handle.
@@ -131,11 +131,10 @@ impl TpmManagerHandle {
         // Build the public area for the RSA key - match tmp2-tools exactly
         let rsa_params = PublicRsaParametersBuilder::new()
             .with_scheme(RsaScheme::create(RsaSchemeAlgorithm::RsaEs, None).unwrap())
-            // .with_key_bits(RsaKeyBits::try_from(key_size).unwrap())
             .with_exponent(RsaExponent::default())
             .with_symmetric(SymmetricDefinitionObject::Null) // Child decryption keys use Null symmetric
             .with_is_decryption_key(true) // Inform builder this is a decryption key
-            .with_key_bits(RsaKeyBits::Rsa2048)
+            .with_key_bits(RsaKeyBits::try_from(key_size)?) // Use the key_size parameter
             .with_restricted(false) // Builder default is false, which is correct for an unrestricted child key
             .build()
             .unwrap();
@@ -193,7 +192,7 @@ impl TpmManagerHandle {
         )?;
         let tpm_object_handle = TpmObjectHandle::new(
             tss_esapi::handles::ObjectHandle::from(key_handle.value()),
-            &mut self.ctx,
+            // &mut self.ctx, // Argument removed
         );
         self.set_rsa_handle(tpm_object_handle.clone());
         Ok((
@@ -217,7 +216,7 @@ impl TpmManagerHandle {
         )?;
         let tpm_object_handle = TpmObjectHandle::new(
             tss_esapi::handles::ObjectHandle::from(key_handle.value()),
-            &mut self.ctx,
+            // &mut self.ctx, // Argument removed
         );
         self.set_rsa_handle(tpm_object_handle.clone());
         Ok(tpm_object_handle)
@@ -225,56 +224,81 @@ impl TpmManagerHandle {
 
     /// Encrypts data using the currently loaded RSA key in the TPM.
     pub fn rsa_encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, tss_esapi::Error> {
-        use tss_esapi::interface_types::algorithm::RsaDecryptAlgorithm;
-        use tss_esapi::structures::Data;
+        // use tss_esapi::interface_types::algorithm::RsaSchemeAlgorithm; // Unused
+        use tss_esapi::structures::Data; // PublicKeyRsa is used via tss_esapi::structures::PublicKeyRsa
+        // use tss_esapi::structures::RsaScheme; // Unused
+
         let rsa_handle = self
             .current_rsa_handle()
             .ok_or(tss_esapi::Error::WrapperError(
                 tss_esapi::WrapperErrorKind::WrongParamSize,
             ))?;
-        let scheme = RsaDecryptionScheme::create(RsaDecryptAlgorithm::RsaEs, None)?;
-        let data = Data::try_from(plaintext)?;
+
         let khandle = KeyHandle::from(rsa_handle.handle().value());
-        let (pubkey, _name1, _name2) = self.ctx.read_public(khandle)?; // Mark unused as _
-        let pubkey_rsa = if let tss_esapi::structures::Public::Rsa { unique, .. } = pubkey {
-            unique
-        } else {
-            return Err(tss_esapi::Error::WrapperError(
-                tss_esapi::WrapperErrorKind::WrongParamSize,
-            ));
-        };
-        let encrypted = self.ctx.rsa_encrypt(
-            khandle, // message is a misnomer, this is the public key lol
-            pubkey_rsa, scheme, data,
-        )?;
-        Ok(encrypted.value().to_vec())
+
+        let rsa_key_scheme = RsaDecryptionScheme::RsaEs;
+        let message_data = Data::try_from(plaintext.to_vec())?; // Ensure it's Vec<u8> for TryFrom<Vec<u8>>
+
+        // Store current sessions
+        let original_sessions = self.ctx.sessions();
+
+        // Set no sessions, to attempt password-less auth for key with empty authValue.
+        // The key has user_with_auth=true, empty authPolicy, and empty authValue.
+        // In this scenario, an empty authorization area (achieved by providing no sessions)
+        // should equate to using TPM_RS_PW with an empty password.
+        self.ctx.set_sessions((None, None, None));
+
+        // note: they fucked up the signatures, so
+        // `message` is actually PublicKeyRsa
+        // and `label` is actually Data, the ciphertext itself
+        // Just assume the input in rsa_encrypt and rsa_decrypt are correct,
+
+        let encrypted_data_result = self.ctx.rsa_encrypt(
+            khandle,
+            tss_esapi::structures::PublicKeyRsa::default(), // Use default, TPM fills this (corresponds to 'label' in TPM2_RSA_Encrypt)
+            rsa_key_scheme,
+            message_data, // (corresponds to 'message' in TPM2_RSA_Encrypt - plaintext)
+        );
+
+        // Restore original sessions
+        self.ctx.set_sessions(original_sessions);
+
+        // Handle the result after restoring sessions
+        let encrypted_data = encrypted_data_result?;
+        Ok(encrypted_data.value().to_vec())
     }
 
     /// Decrypts data using the currently loaded RSA key in the TPM.
     pub fn rsa_decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, tss_esapi::Error> {
         use tss_esapi::handles::KeyHandle;
-        use tss_esapi::structures::{Data, RsaDecryptionScheme};
+        // use tss_esapi::interface_types::algorithm::RsaSchemeAlgorithm; // Unused
+        use tss_esapi::structures::{Data, PublicKeyRsa}; // RsaScheme unused
+        // use tss_esapi::structures::RsaScheme; // Unused
+
         let rsa_handle = self
             .current_rsa_handle()
             .ok_or(tss_esapi::Error::WrapperError(
                 tss_esapi::WrapperErrorKind::WrongParamSize,
             ))?;
-        let scheme = RsaDecryptionScheme::create(
-            tss_esapi::interface_types::algorithm::RsaDecryptAlgorithm::RsaEs,
-            None,
-        )?;
+
         let khandle = KeyHandle::from(rsa_handle.handle().value());
-        let (pubkey, _name1, _name2) = self.ctx.read_public(khandle)?; // Mark unused as _
-        let pubkey_rsa = if let tss_esapi::structures::Public::Rsa { unique, .. } = pubkey {
-            unique
-        } else {
-            return Err(tss_esapi::Error::WrapperError(
-                tss_esapi::WrapperErrorKind::WrongParamSize,
-            ));
-        };
-        let data = Data::try_from(ciphertext)?;
-        let decrypted = self.ctx.rsa_decrypt(khandle, pubkey_rsa, scheme, data)?;
-        Ok(decrypted.value().to_vec())
+
+        let rsa_key_scheme = RsaDecryptionScheme::RsaEs;
+        // Correctly convert ciphertext to PublicKeyRsa
+        let rsa_cipher_text = PublicKeyRsa::try_from(ciphertext.to_vec())?;
+        let label_data = Data::default();
+
+        // they also fucked up the signatures here, so
+        // `message` is actually PublicKeyRsa
+        // and `label` is actually Data, the label data
+
+        let decrypted_data = self.ctx.rsa_decrypt(
+            khandle,
+            rsa_cipher_text, // Use PublicKeyRsa typed variable
+            rsa_key_scheme,
+            label_data,
+        )?;
+        Ok(decrypted_data.value().to_vec())
     }
 
     /// Create a new primary key in the TPM and return a new TpmManagerHandle.
@@ -366,10 +390,10 @@ impl TpmManagerHandle {
         // Let's assume the current structure with *mut ctx is managed correctly by the caller or TpmManagerHandle's lifetime.
         // When creating primary_handle, it will be stored in TpmManagerHandle which also stores ctx.
         // So, we pass a pointer to the ctx that TpmManagerHandle will own.
-        let primary_handle_raw_ctx_ptr = &mut ctx as *mut tss_esapi::Context;
+        // let primary_handle_raw_ctx_ptr = &mut ctx as *mut tss_esapi::Context; // No longer needed
         let primary_handle = TpmObjectHandle::new(
             create_primary_result.key_handle.into(),
-            primary_handle_raw_ctx_ptr,
+            // primary_handle_raw_ctx_ptr, // Argument removed
         );
         Ok(TpmManagerHandle::new(ctx, primary_handle))
     }
@@ -393,7 +417,8 @@ mod tests {
     #[test]
     fn test_tpm_object_handle() {
         let mut ctx = Context::new(default_tcti_handle()).unwrap();
-        let primary_handle = TpmObjectHandle::new(ObjectHandle::from(0x81010001), &mut ctx);
+        let primary_handle =
+            TpmObjectHandle::new(ObjectHandle::from(0x81010001) /*, &mut ctx*/); // Argument removed
         let tpm_handle = TpmManagerHandle::new(ctx, primary_handle);
 
         assert_eq!(tpm_handle.primary_handle().handle().value(), 0x81010001);
