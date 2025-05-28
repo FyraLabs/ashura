@@ -29,20 +29,20 @@ impl TpmObjectHandle {
     }
 }
 
-impl Drop for TpmObjectHandle {
-    fn drop(&mut self) {
-        // Unload the TPM object when the handle is dropped
-        unsafe {
-            if let Some(ctx) = self.ctx.as_mut() {
-                if let Err(e) = ctx.flush_context(self.handle) {
-                    eprintln!("Failed to flush TPM object handle: {}", e);
-                }
-            } else {
-                eprintln!("Failed to flush TPM object handle: context pointer was null");
-            }
-        }
-    }
-}
+// impl Drop for TpmObjectHandle {
+//     fn drop(&mut self) {
+//         // Unload the TPM object when the handle is dropped
+//         unsafe {
+//             if let Some(ctx) = self.ctx.as_mut() {
+//                 if let Err(e) = ctx.flush_context(self.handle) {
+//                     eprintln!("Failed to flush TPM object handle: {}", e);
+//                 }
+//             } else {
+//                 eprintln!("Failed to flush TPM object handle: context pointer was null");
+//             }
+//         }
+//     }
+// }
 
 pub struct TpmManagerHandle {
     ctx: tss_esapi::Context,
@@ -145,14 +145,15 @@ impl TpmManagerHandle {
             rsa_params
         );
 
-        // Child key attributes to match tpm2-tools, but also try restricted=true as parent is restricted.
+        // Child key attributes to match tpm2-tools: fixedtpm|fixedparent|sensitivedataorigin|userwithauth|decrypt
+        // This means restricted is false.
         let object_attrs = ObjectAttributesBuilder::new()
             .with_fixed_tpm(true)
             .with_fixed_parent(true)
             .with_sensitive_data_origin(true)
             .with_user_with_auth(true)
             .with_decrypt(true)
-            .with_restricted(true)              // Changed to true
+            .with_restricted(false) // Reverted to false, aligning with tpm2-tools output for child
             .build()?;
 
         println!("[KeyPairGen] Object attributes: {:?}", object_attrs);
@@ -166,7 +167,10 @@ impl TpmManagerHandle {
             .build()
             .unwrap();
 
-        println!("[KeyPairGen] Public area for RSA key: {:?}", public);
+        println!(
+            "[KeyPairGen] Keypair generation successful! Public area for RSA key: {:?}",
+            public
+        );
 
         let sensitive = SensitiveData::default();
 
