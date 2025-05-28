@@ -1,10 +1,25 @@
 // use log::{debug, error, info, warn};
-use std::cell::RefCell;
-use std::convert::TryFrom;
+// use std::cell::RefCell; // Unused
+use std::convert::TryFrom; // TryInto is unused
+use tss_esapi::attributes::ObjectAttributesBuilder;
 use tss_esapi::handles::KeyHandle;
+use tss_esapi::handles::ObjectHandle;
+use tss_esapi::interface_types::algorithm::{HashingAlgorithm, PublicAlgorithm};
+use tss_esapi::interface_types::resource_handles::Hierarchy;
 use tss_esapi::structures::RsaDecryptionScheme; // Keep for rsa_encrypt/decrypt
+use tss_esapi::structures::{
+    CreateKeyResult,
+    Digest,
+    InitialValue,
+    MaxBuffer,
+    Private,
+    Public,
+    PublicBuilder,
+    SymmetricCipherParameters,
+    SymmetricDefinitionObject, // SensitiveData is unused
+};
 use tss_esapi::traits::Marshall;
-use tss_esapi::{handles::ObjectHandle, tcti_ldr::TabrmdConfig};
+use tss_esapi::{Context, tcti_ldr::TabrmdConfig}; // Keep Context import
 
 pub fn default_tcti_handle() -> tss_esapi::TctiNameConf {
     tss_esapi::TctiNameConf::from_environment_variable()
@@ -45,18 +60,18 @@ impl TpmObjectHandle {
 // }
 
 pub struct TpmManagerHandle {
-    ctx: tss_esapi::Context,
+    ctx: Context, // Assuming Context is directly held
     primary_handle: TpmObjectHandle,
-    rsa_handle: RefCell<Option<TpmObjectHandle>>,
+    current_aes_handle: Option<TpmObjectHandle>, // Changed from current_rsa_handle
 }
 
 impl TpmManagerHandle {
     /// Creates a new `TpmManagerHandle` with the given context and primary handle.
-    pub fn new(ctx: tss_esapi::Context, primary_handle: TpmObjectHandle) -> Self {
+    pub fn new(ctx: Context, primary_handle: TpmObjectHandle) -> Self {
         Self {
             ctx,
             primary_handle,
-            rsa_handle: RefCell::new(None),
+            current_aes_handle: None, // Initialize current_aes_handle
         }
     }
 
@@ -65,14 +80,14 @@ impl TpmManagerHandle {
         &self.primary_handle
     }
 
-    /// Sets the RSA handle, replacing any existing one.
-    pub fn set_rsa_handle(&self, rsa_handle: TpmObjectHandle) {
-        *self.rsa_handle.borrow_mut() = Some(rsa_handle);
+    /// Sets the AES handle, replacing any existing one.
+    pub fn set_aes_handle(&mut self, handle: TpmObjectHandle) {
+        self.current_aes_handle = Some(handle);
     }
 
-    /// Returns a clone of the currently loaded RSA key handle, if present.
-    pub fn current_rsa_handle(&self) -> Option<TpmObjectHandle> {
-        self.rsa_handle.borrow().clone()
+    /// Returns a reference to the currently loaded AES key handle, if present.
+    pub fn current_aes_handle(&self) -> Option<&TpmObjectHandle> {
+        self.current_aes_handle.as_ref()
     }
 
     /// Generate RSA key pair in the TPM and store it in the context.
@@ -194,7 +209,7 @@ impl TpmManagerHandle {
             tss_esapi::handles::ObjectHandle::from(key_handle.value()),
             // &mut self.ctx, // Argument removed
         );
-        self.set_rsa_handle(tpm_object_handle.clone());
+        self.set_aes_handle(tpm_object_handle.clone());
         Ok((
             tpm_object_handle,
             create_result.out_public,
@@ -218,7 +233,7 @@ impl TpmManagerHandle {
             tss_esapi::handles::ObjectHandle::from(key_handle.value()),
             // &mut self.ctx, // Argument removed
         );
-        self.set_rsa_handle(tpm_object_handle.clone());
+        self.set_aes_handle(tpm_object_handle.clone());
         Ok(tpm_object_handle)
     }
 
@@ -229,7 +244,7 @@ impl TpmManagerHandle {
         // use tss_esapi::structures::RsaScheme; // Unused
 
         let rsa_handle = self
-            .current_rsa_handle()
+            .current_aes_handle()
             .ok_or(tss_esapi::Error::WrapperError(
                 tss_esapi::WrapperErrorKind::WrongParamSize,
             ))?;
@@ -276,7 +291,7 @@ impl TpmManagerHandle {
         // use tss_esapi::structures::RsaScheme; // Unused
 
         let rsa_handle = self
-            .current_rsa_handle()
+            .current_aes_handle()
             .ok_or(tss_esapi::Error::WrapperError(
                 tss_esapi::WrapperErrorKind::WrongParamSize,
             ))?;
@@ -301,170 +316,369 @@ impl TpmManagerHandle {
         Ok(decrypted_data.value().to_vec())
     }
 
-    /// Create a new primary key in the TPM and return a new TpmManagerHandle.
-    /// This will generate a storage primary key suitable for use as a parent for child keys.
-    pub fn create_with_primary(mut ctx: tss_esapi::Context) -> Result<Self, tss_esapi::Error> {
-        // Added mut ctx
-        use tss_esapi::attributes::ObjectAttributesBuilder;
-        use tss_esapi::interface_types::algorithm::{HashingAlgorithm, PublicAlgorithm};
-        use tss_esapi::interface_types::key_bits::RsaKeyBits;
-        use tss_esapi::interface_types::resource_handles::Hierarchy;
-        use tss_esapi::structures::{
-            PublicBuilder,
-            PublicKeyRsa,
-            PublicRsaParametersBuilder,
-            RsaExponent,
-            // RsaScheme, // No longer needed directly here, new_restricted_decryption_key handles it
-            SymmetricDefinitionObject,
-        };
-
-        // Parent key attributes: restricted decryption key
-        let object_attrs = ObjectAttributesBuilder::new()
+    /// Generates a new AES key in the TPM under the primary key.
+    pub fn generate_aes_key(
+        &mut self,
+        key_bits: tss_esapi::interface_types::key_bits::AesKeyBits,
+        mode: tss_esapi::interface_types::algorithm::SymmetricMode,
+    ) -> Result<(TpmObjectHandle, Public, Private), tss_esapi::Error> {
+        // AES key attributes: must be restricted if parent is restricted.
+        let object_attributes = ObjectAttributesBuilder::new()
             .with_fixed_tpm(true)
             .with_fixed_parent(true)
+            .with_st_clear(false) // Per example for AES key
             .with_sensitive_data_origin(true)
-            .with_user_with_auth(true)
+            .with_user_with_auth(true) // Allows use with null auth if authValue is empty
+            .with_sign_encrypt(true) // For symmetric keys, enables encryption/decryption
             .with_decrypt(true)
-            .with_restricted(true) // Restricted parent
-            .build()
-            .unwrap();
+            .with_restricted(true) // Child key must be restricted if parent is restricted
+            .build()?;
 
-        // Parent key RSA parameters: For a restricted decryption key, scheme is Null, symmetric is non-Null.
-        // This uses the helper that correctly sets internal flags for the builder.
-        let rsa_params = PublicRsaParametersBuilder::new_restricted_decryption_key(
-            SymmetricDefinitionObject::AES_128_CFB, // Example symmetric cipher
-            RsaKeyBits::Rsa2048,
-            RsaExponent::default(),
-        )
-        .build()
-        .unwrap();
+        let sym_def_obj = match (key_bits, mode) {
+            (
+                tss_esapi::interface_types::key_bits::AesKeyBits::Aes128,
+                tss_esapi::interface_types::algorithm::SymmetricMode::Cfb,
+            ) => SymmetricDefinitionObject::AES_128_CFB,
+            (
+                tss_esapi::interface_types::key_bits::AesKeyBits::Aes192,
+                tss_esapi::interface_types::algorithm::SymmetricMode::Cfb,
+            ) => SymmetricDefinitionObject::Aes {
+                key_bits: tss_esapi::interface_types::key_bits::AesKeyBits::Aes192,
+                mode: tss_esapi::interface_types::algorithm::SymmetricMode::Cfb,
+            },
+            (
+                tss_esapi::interface_types::key_bits::AesKeyBits::Aes256,
+                tss_esapi::interface_types::algorithm::SymmetricMode::Cfb,
+            ) => SymmetricDefinitionObject::AES_256_CFB,
+            // For CBC and other modes, use the generic Aes variant
+            _ => SymmetricDefinitionObject::Aes { key_bits, mode },
+        };
 
-        println!(
-            "[PrimaryCreate] Creating primary key with RSA parameters: {:?}",
-            rsa_params
-        );
-        println!("[PrimaryCreate] Object attributes: {:?}", object_attrs);
+        let aes_params = SymmetricCipherParameters::new(sym_def_obj);
 
-        // Construct the Public structure for the primary key using PublicBuilder
-        let public_for_primary = PublicBuilder::new()
-            .with_public_algorithm(PublicAlgorithm::Rsa)
+        let key_public_template = PublicBuilder::new()
+            .with_public_algorithm(PublicAlgorithm::SymCipher)
             .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
-            .with_object_attributes(object_attrs)
-            .with_rsa_parameters(rsa_params)
-            // .with_auth_policy(Digest::default()) // auth_policy is optional in builder, defaults to empty
-            .with_rsa_unique_identifier(PublicKeyRsa::default()) // TPM fills this
-            .build()
-            .unwrap();
+            .with_object_attributes(object_attributes)
+            .with_symmetric_cipher_parameters(aes_params)
+            .with_symmetric_cipher_unique_identifier(Digest::default()) // For symmetric keys
+            .build()?;
+
+        let (created_private, created_public) = self.ctx.execute_with_nullauth_session(|ctx| {
+            ctx.create(
+                self.primary_handle.handle().into(),
+                key_public_template.clone(),
+                None, // authValue for the new key (empty)
+                None, // initialData
+                None, // creationPCRs
+                None, // ticket
+            )
+            .map(|key: CreateKeyResult| (key.out_private, key.out_public))
+        })?;
+
+        let loaded_key_handle = self.ctx.execute_with_nullauth_session(|ctx| {
+            ctx.load(
+                self.primary_handle.handle().into(),
+                created_private.clone(),
+                created_public.clone(),
+            )
+        })?;
+
+        let tpm_object_handle = TpmObjectHandle::new(loaded_key_handle.into());
+        self.set_aes_handle(tpm_object_handle.clone());
+
+        Ok((tpm_object_handle, created_public, created_private))
+    }
+
+    /// Load an AES key from TPM2B_PUBLIC and TPM2B_PRIVATE blobs.
+    pub fn load_aes_key(
+        &mut self,
+        public: Public,
+        private: Private,
+    ) -> Result<TpmObjectHandle, tss_esapi::Error> {
+        let key_handle = self.ctx.execute_with_nullauth_session(|ctx| {
+            ctx.load(self.primary_handle.handle().into(), private, public)
+        })?;
+        let tpm_object_handle = TpmObjectHandle::new(key_handle.into());
+        self.set_aes_handle(tpm_object_handle.clone());
+        Ok(tpm_object_handle)
+    }
+
+    /// Encrypts data using the currently loaded AES key in the TPM.
+    /// Generates a new IV for each encryption operation.
+    pub fn aes_encrypt(
+        &mut self,
+        plaintext: &[u8],
+        mode: tss_esapi::interface_types::algorithm::SymmetricMode, // Mode must match the key's mode
+    ) -> Result<(Vec<u8>, InitialValue), tss_esapi::Error> {
+        let aes_key_handle = self
+            .current_aes_handle()
+            .ok_or_else(|| {
+                tss_esapi::Error::WrapperError(tss_esapi::WrapperErrorKind::InvalidParam)
+            })?
+            .handle();
+
+        let iv = self.ctx.execute_with_nullauth_session(|ctx| {
+            ctx.get_random(InitialValue::MAX_SIZE)
+                .and_then(|random_bytes| {
+                    InitialValue::try_from(random_bytes.to_vec()).map_err(|_| {
+                        // e is unused
+                        tss_esapi::Error::WrapperError(
+                            tss_esapi::WrapperErrorKind::InvalidParam, // Or a more specific error
+                        )
+                    })
+                })
+        })?;
+
+        let padded_plaintext = pkcs7_pad(plaintext);
+        let data_to_encrypt = MaxBuffer::try_from(padded_plaintext).map_err(|_| {
+            tss_esapi::Error::WrapperError(tss_esapi::WrapperErrorKind::InvalidParam)
+        })?;
+
+        let (encrypted_data, _returned_iv) = self.ctx.execute_with_nullauth_session(|ctx| {
+            ctx.encrypt_decrypt_2(
+                aes_key_handle.into(),
+                false, // false for encrypt
+                mode,  // e.g., SymmetricMode::Cbc
+                data_to_encrypt.clone(),
+                iv.clone(),
+            )
+        })?;
+
+        Ok((encrypted_data.to_vec(), iv)) // Return the original IV used for encryption
+    }
+
+    /// Decrypts data using the currently loaded AES key in the TPM.
+    pub fn aes_decrypt(
+        &mut self,
+        ciphertext: &[u8],
+        iv: InitialValue, // IV used for encryption must be provided
+        mode: tss_esapi::interface_types::algorithm::SymmetricMode, // Mode must match the key's mode
+    ) -> Result<Vec<u8>, tss_esapi::Error> {
+        let aes_key_handle = self
+            .current_aes_handle()
+            .ok_or_else(|| {
+                tss_esapi::Error::WrapperError(tss_esapi::WrapperErrorKind::InvalidParam)
+            })?
+            .handle();
+
+        let data_to_decrypt = MaxBuffer::try_from(ciphertext.to_vec()).map_err(|_| {
+            tss_esapi::Error::WrapperError(tss_esapi::WrapperErrorKind::InvalidParam)
+        })?;
+
+        let (decrypted_padded_data, _returned_iv) =
+            self.ctx.execute_with_nullauth_session(|ctx| {
+                ctx.encrypt_decrypt_2(
+                    aes_key_handle.into(),
+                    true, // true for decrypt
+                    mode, // e.g., SymmetricMode::Cbc
+                    data_to_decrypt.clone(),
+                    iv,
+                )
+            })?;
+
+        pkcs7_unpad(&decrypted_padded_data.to_vec())
+    }
+
+    /// Create a new primary key in the TPM and return a new TpmManagerHandle.
+    /// This will generate a symmetric primary key suitable for use as a parent for child AES keys.
+    pub fn create_with_primary(mut ctx: Context) -> Result<Self, tss_esapi::Error> {
+        // Primary key attributes: restricted, decrypt, suitable for parenting symmetric keys.
+        let object_attributes = ObjectAttributesBuilder::new()
+            .with_fixed_tpm(true)
+            .with_fixed_parent(true)
+            .with_st_clear(true) // Changed to true to match example_aes_encryptdecrypt.rs
+            .with_sensitive_data_origin(true)
+            .with_user_with_auth(true) // Allows use with null auth if authValue is empty
+            .with_decrypt(true) // Allows key to be used for decryption (relevant for restricted keys)
+            .with_restricted(true) // Restricted key: can only be parent to restricted keys or be used in specific ways
+            .build()?;
+
+        // Primary key symmetric parameters (e.g., AES_128_CFB as in example)
+        // This defines the "type" of symmetric key the primary key is.
+        let primary_symmetric_params =
+            SymmetricCipherParameters::new(SymmetricDefinitionObject::AES_128_CFB);
+        let public_for_primary = PublicBuilder::new()
+            .with_public_algorithm(PublicAlgorithm::SymCipher) // Primary key is a symmetric cipher
+            .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+            .with_object_attributes(object_attributes)
+            .with_symmetric_cipher_parameters(primary_symmetric_params)
+            .with_symmetric_cipher_unique_identifier(Digest::default()) // For symmetric keys
+            .build()?;
 
         println!(
-            "[PrimaryCreate] Public area for primary key: {:?}",
+            "[PrimaryCreate] Creating symmetric primary key with public template: {:?}",
             public_for_primary
         );
 
-        // Start an HMAC session for authorization
-        // ctx is already mutable due to function signature
-        let session = ctx.start_auth_session(
-            None,
-            None,
-            None,
-            tss_esapi::constants::SessionType::Hmac,
-            SymmetricDefinitionObject::AES_128_CFB.into(), // Session symmetric can remain for session security
-            HashingAlgorithm::Sha256,
-        )?;
-        ctx.set_sessions((session, None, None));
+        // Create primary key using null auth session, assuming empty auth value for Owner hierarchy.
+        let create_primary_result = ctx.execute_with_nullauth_session(|ctx_session| {
+            ctx_session.create_primary(
+                Hierarchy::Owner, // Example uses Owner, suitable for general user keys
+                public_for_primary,
+                None, // authValue (empty)
+                None, // initialData
+                None, // creationPCRs
+                None, // ticket
+            )
+        })?;
 
-        let create_primary_result = ctx.create_primary(
-            Hierarchy::Endorsement,
-            public_for_primary,
-            None,
-            None,
-            None,
-            None,
-        )?;
-
-        // The TpmObjectHandle needs a pointer to the context to flush it on drop.
-        // Storing a raw pointer `*mut tss_esapi::Context` is tricky if `ctx` is moved out of `create_with_primary`.
-        // However, TpmManagerHandle takes ownership of ctx.
-        // For TpmObjectHandle to safely use the context, it must not outlive TpmManagerHandle.
-        // A raw pointer is okay if TpmManagerHandle owns ctx and TpmObjectHandle is used carefully.
-        // Let's assume the current structure with *mut ctx is managed correctly by the caller or TpmManagerHandle's lifetime.
-        // When creating primary_handle, it will be stored in TpmManagerHandle which also stores ctx.
-        // So, we pass a pointer to the ctx that TpmManagerHandle will own.
-        // let primary_handle_raw_ctx_ptr = &mut ctx as *mut tss_esapi::Context; // No longer needed
-        let primary_handle = TpmObjectHandle::new(
-            create_primary_result.key_handle.into(),
-            // primary_handle_raw_ctx_ptr, // Argument removed
-        );
+        let primary_handle = TpmObjectHandle::new(create_primary_result.key_handle.into());
         Ok(TpmManagerHandle::new(ctx, primary_handle))
     }
 }
 
-/// Export the RSA keypair into marshalled blobs (Vec<u8>).
-pub fn export_rsa_keypair_blobs(
-    public: &tss_esapi::structures::Public,
-    private: &tss_esapi::structures::Private,
+/// Export the key material into marshalled blobs (Vec<u8>).
+pub fn export_key_material_blobs(
+    public: &Public,
+    private: &Private,
 ) -> Result<(Vec<u8>, Vec<u8>), tss_esapi::Error> {
     let pub_blob = public.marshall()?;
-    let priv_blob = private.value().to_vec(); // Access the inner buffer and convert to Vec<u8>
+    let priv_blob = private.to_vec();
     Ok((pub_blob, priv_blob))
+}
+
+// WARNING: Manually implemented pkcs7 follows. This has not been audited. Don't use this
+// in production.
+const AES_BLOCK_SIZE: usize = 16; // AES block size is 128 bits (16 bytes)
+
+fn pkcs7_pad(data: &[u8]) -> Vec<u8> {
+    let data_len = data.len();
+    // PKCS7 always pads, even if the data is already a multiple of the block size.
+    let padding_value = AES_BLOCK_SIZE - (data_len % AES_BLOCK_SIZE);
+    let mut padded_data = data.to_vec();
+    padded_data.resize(data_len + padding_value, padding_value as u8);
+    padded_data
+}
+
+fn pkcs7_unpad(data: &[u8]) -> Result<Vec<u8>, tss_esapi::Error> {
+    if data.is_empty() {
+        return Err(tss_esapi::Error::WrapperError(
+            tss_esapi::WrapperErrorKind::InvalidParam,
+        ));
+    }
+    let last_byte_val = data[data.len() - 1];
+    if last_byte_val == 0 || last_byte_val as usize > AES_BLOCK_SIZE {
+        return Err(tss_esapi::Error::WrapperError(
+            tss_esapi::WrapperErrorKind::InvalidParam,
+        ));
+    }
+    let pad_len = last_byte_val as usize;
+    if data.len() < pad_len {
+        return Err(tss_esapi::Error::WrapperError(
+            tss_esapi::WrapperErrorKind::InvalidParam,
+        ));
+    }
+    for i in 0..pad_len {
+        if data[data.len() - 1 - i] != last_byte_val {
+            return Err(tss_esapi::Error::WrapperError(
+                tss_esapi::WrapperErrorKind::InvalidParam,
+            ));
+        }
+    }
+    Ok(data[..data.len() - pad_len].to_vec())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tss_esapi::{Context, tcti_ldr::NetworkTPMConfig};
+    use tss_esapi::{
+        Tcti, // For Tcti::Swtpm
+        interface_types::{algorithm::SymmetricMode, key_bits::AesKeyBits},
+        tcti_ldr::NetworkTPMConfig,
+        traits::UnMarshall,
+    };
+    // use zeroize::Zeroizing; // Unused
+
+    // Assuming default_tcti_handle() is defined elsewhere or replace if not.
+    // For consistency, let's use Swtpm for all tests if default_tcti_handle is problematic.
+    fn get_test_tcti() -> Tcti {
+        Tcti::Swtpm(NetworkTPMConfig::default())
+    }
 
     #[test]
     fn test_tpm_object_handle() {
-        let mut ctx = Context::new(default_tcti_handle()).unwrap();
-        let primary_handle =
-            TpmObjectHandle::new(ObjectHandle::from(0x81010001) /*, &mut ctx*/); // Argument removed
+        let ctx = Context::new(get_test_tcti()).unwrap(); // mut removed
+        let primary_handle = TpmObjectHandle::new(ObjectHandle::from(0x81010001));
         let tpm_handle = TpmManagerHandle::new(ctx, primary_handle);
 
         assert_eq!(tpm_handle.primary_handle().handle().value(), 0x81010001);
     }
 
     #[test]
-    fn test_generate_rsa_key_pair_and_encrypt_decrypt() {
-        let ctx = Context::new(tss_esapi::Tcti::Swtpm(NetworkTPMConfig::default()))
-            .expect("Failed to create TPM context");
+    fn test_generate_aes_key_and_encrypt_decrypt() {
+        let ctx = Context::new(get_test_tcti()).expect("Failed to create TPM context");
         let mut tpm_handle = TpmManagerHandle::create_with_primary(ctx).unwrap();
 
-        // Generate a 2048-bit RSA key pair
-        let (rsa_handle, public, private) = tpm_handle.generate_rsa_key_pair(2048).unwrap();
+        // Generate an AES-128-CFB key (changed from Cbc for diagnostics)
+        let (aes_handle, public, private) = tpm_handle
+            .generate_aes_key(AesKeyBits::Aes128, SymmetricMode::Cfb) // Changed to Cfb
+            .unwrap();
 
-        // Export blobs and reload the key to test load_key
-        let (pub_blob, priv_blob) = export_rsa_keypair_blobs(&public, &private).unwrap();
-        let loaded_handle = tpm_handle
-            .load_key(public.clone(), private.clone())
-            .expect("Failed to load key");
+        // Export blobs and reload the key to test load_aes_key
+        let (pub_blob, priv_blob) = export_key_material_blobs(&public, &private).unwrap();
 
-        // Silence unused variable warnings for test clarity
-        let _ = rsa_handle;
+        // Create a new context for loading, or re-use if appropriate and state is managed
+        let load_ctx =
+            Context::new(get_test_tcti()).expect("Failed to create TPM context for load"); // mut removed
+        let mut load_tpm_handle =
+            TpmManagerHandle::new(load_ctx, tpm_handle.primary_handle().clone()); // Clone primary handle if it's just an ID
+
+        // To load the key, we need its public and private parts.
+        // The `Private` structure needs to be unmarshalled if we only have `priv_blob`.
+        // For this test, we have `public` and `private` structs directly.
+        let loaded_handle = load_tpm_handle
+            .load_aes_key(public.clone(), private.clone())
+            .expect("Failed to load AES key");
+
+        // Ensure the original handle and loaded handle point to the same logical key
+        // This might involve comparing properties or just ensuring load was successful.
+        // For now, we trust load_aes_key sets the current_aes_handle correctly.
+
+        // Test encryption and decryption using the loaded key via load_tpm_handle
+        let plaintext = b"hello AES TPM!";
+        let (ciphertext, iv) = load_tpm_handle
+            .aes_encrypt(plaintext, SymmetricMode::Cfb) // Mode must match key (Changed to Cfb)
+            .expect("AES Encryption failed");
+        assert_ne!(ciphertext, plaintext);
+
+        let decrypted = load_tpm_handle
+            .aes_decrypt(&ciphertext, iv, SymmetricMode::Cfb) // Mode must match key (Changed to Cfb)
+            .expect("AES Decryption failed");
+        assert_eq!(decrypted, plaintext);
+
+        // Test with the original handle as well
+        let (ciphertext2, iv2) = tpm_handle
+            .aes_encrypt(plaintext, SymmetricMode::Cfb) // Changed to Cfb
+            .expect("AES Encryption failed on original handle");
+        assert_ne!(ciphertext2, plaintext);
+        let decrypted2 = tpm_handle
+            .aes_decrypt(&ciphertext2, iv2, SymmetricMode::Cfb) // Changed to Cfb
+            .expect("AES Decryption failed on original handle");
+        assert_eq!(decrypted2, plaintext);
+
+        // Silence unused variable warnings for test clarity if any remain
+        let _ = aes_handle;
         let _ = pub_blob;
         let _ = priv_blob;
         let _ = loaded_handle;
-
-        // Test encryption and decryption
-        let plaintext = b"hello TPM!";
-        let ciphertext = tpm_handle
-            .rsa_encrypt(plaintext)
-            .expect("Encryption failed");
-        assert_ne!(ciphertext, plaintext);
-
-        let decrypted = tpm_handle
-            .rsa_decrypt(&ciphertext)
-            .expect("Decryption failed");
-        assert_eq!(&decrypted[..plaintext.len()], plaintext);
     }
 
     #[test]
-    fn test_export_rsa_keypair_blobs() {
-        let ctx = Context::new(default_tcti_handle()).unwrap();
+    fn test_export_key_material_blobs() {
+        let ctx = Context::new(get_test_tcti()).unwrap();
         let mut tpm_handle = TpmManagerHandle::create_with_primary(ctx).unwrap();
-        let (_rsa_handle, public, private) = tpm_handle.generate_rsa_key_pair(2048).unwrap();
-        let (pub_blob, priv_blob) = export_rsa_keypair_blobs(&public, &private).unwrap();
+        let (_aes_handle, public, private) = tpm_handle
+            .generate_aes_key(AesKeyBits::Aes128, SymmetricMode::Cbc)
+            .unwrap();
+        let (pub_blob, priv_blob) = export_key_material_blobs(&public, &private).unwrap();
         assert!(!pub_blob.is_empty());
         assert!(!priv_blob.is_empty());
+
+        // Optional: Try to unmarshall and verify
+        let unmarshalled_public = Public::unmarshall(&pub_blob).unwrap();
+        assert_eq!(public, unmarshalled_public);
+        // let unmarshalled_private =
+        // assert_eq!(private, unmarshalled_private);
     }
 }
