@@ -35,11 +35,11 @@ impl MasterKey {
         &self.key
     }
 
-    pub fn unseal_from_ciphertxt(ciphertxt: &[u8], tpm_context: TpmContext) -> Self {
+    pub fn unseal_from_ciphertxt(ciphertxt: &[u8], tpm_context: crate::tpm::TpmManagerHandle) -> Self {
         todo!("Implement unsealing logic")
     }
 
-    pub fn seal_to_ciphertext(&self, tpm_context: TpmContext) -> Vec<u8> {
+    pub fn seal_to_ciphertext(&self, tpm_context: crate::tpm::TpmManagerHandle) -> Vec<u8> {
         todo!("Implement sealing logic")
     }
 }
