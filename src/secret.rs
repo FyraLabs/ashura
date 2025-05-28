@@ -1,14 +1,17 @@
+use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, time::SystemTime};
+
+use crate::kv::EncryptedBlob;
 
 /// A "secret" stored inside the database, AKA the actual K/V pair itself.
 /// This struct will be contained as a sled value with a unique salt.
 ///
 /// This will be a bincode-serialized struct containing the actual secret data
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Encode, Decode)]
 pub struct Secret {
     /// Encrypted ciphertext version of the secret data
-    ciphertext: Vec<u8>,
+    ciphertext: EncryptedBlob,
     /// Initialization vector used for encryption
     iv: [u8; 12],
     /// A unique salt used with the master key to derive the intermediate key
@@ -41,7 +44,7 @@ impl Secret {
         metadata: SecretMeta,
     ) -> Self {
         Self {
-            ciphertext,
+            ciphertext: crate::kv::EncryptedBlob(ciphertext),
             iv,
             salt,
             mfa_sources,
@@ -52,7 +55,7 @@ impl Secret {
 
     /// Returns a reference to the ciphertext.
     pub fn ciphertext(&self) -> &Vec<u8> {
-        &self.ciphertext
+        &self.ciphertext.0
     }
 
     /// Returns the initialization vector.
@@ -70,7 +73,7 @@ impl Secret {
 ///
 /// This struct contains information about the secret, such as its metadata and additional encryption details
 /// that SecretData provides.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
 pub struct SecretMeta {
     /// Optional description of the secret.
     pub description: Option<String>,
@@ -92,7 +95,7 @@ impl SecretMeta {
     }
 
     /// Simply update the metadata's updated_at field to the current time.
-    /// 
+    ///
     /// The other fields have to be set explicitly.
     pub fn update(&mut self) {
         self.updated_at = SystemTime::now();

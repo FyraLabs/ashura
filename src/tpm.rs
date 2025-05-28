@@ -65,6 +65,23 @@ pub struct TpmManagerHandle {
     current_aes_handle: Option<TpmObjectHandle>, // Changed from current_rsa_handle
 }
 
+impl Drop for TpmManagerHandle {
+    fn drop(&mut self) {
+        // Flush the primary handle when the TpmManagerHandle is dropped
+        self.ctx.clear(self.primary_handle.handle().into()).unwrap_or_else(|e| {
+            eprintln!("Failed to flush primary handle on drop: {}", e);
+        });
+        if let Some(aes_handle) = &self.current_aes_handle {
+            // Flush the current AES handle if it exists
+            self.ctx.clear(aes_handle.handle().into()).unwrap_or_else(|e| {
+                eprintln!("Failed to flush current AES handle on drop: {}", e);
+            });
+        }
+
+        self.ctx.clear_sessions();
+    }
+}
+
 impl TpmManagerHandle {
     /// Creates a new `TpmManagerHandle` with the given context and primary handle.
     pub fn new(ctx: Context, primary_handle: TpmObjectHandle) -> Self {
@@ -413,9 +430,7 @@ impl TpmManagerHandle {
     ) -> Result<(Vec<u8>, InitialValue), tss_esapi::Error> {
         let aes_key_handle = self
             .current_aes_handle()
-            .ok_or_else(|| {
-                tss_esapi::Error::WrapperError(tss_esapi::WrapperErrorKind::InvalidParam)
-            })?
+            .ok_or(tss_esapi::Error::WrapperError(tss_esapi::WrapperErrorKind::InvalidParam))?
             .handle();
 
         let iv = self.ctx.execute_with_nullauth_session(|ctx| {
@@ -457,9 +472,7 @@ impl TpmManagerHandle {
     ) -> Result<Vec<u8>, tss_esapi::Error> {
         let aes_key_handle = self
             .current_aes_handle()
-            .ok_or_else(|| {
-                tss_esapi::Error::WrapperError(tss_esapi::WrapperErrorKind::InvalidParam)
-            })?
+            .ok_or(tss_esapi::Error::WrapperError(tss_esapi::WrapperErrorKind::InvalidParam))?
             .handle();
 
         let data_to_decrypt = MaxBuffer::try_from(ciphertext.to_vec()).map_err(|_| {
@@ -583,6 +596,7 @@ fn pkcs7_unpad(data: &[u8]) -> Result<Vec<u8>, tss_esapi::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tss_esapi::{
         Tcti, // For Tcti::Swtpm
         interface_types::{algorithm::SymmetricMode, key_bits::AesKeyBits},
@@ -592,9 +606,11 @@ mod tests {
     // use zeroize::Zeroizing; // Unused
 
     // Assuming default_tcti_handle() is defined elsewhere or replace if not.
-    // For consistency, let's use Swtpm for all tests if default_tcti_handle is problematic.
+    // For consistency, let's use Swtpm for all tests if default_tcti_handle is problematic
     fn get_test_tcti() -> Tcti {
-        Tcti::Swtpm(NetworkTPMConfig::default())
+        Tcti::from_environment_variable().unwrap_or(
+            Tcti::Swtpm(NetworkTPMConfig::default())
+        )
     }
 
     #[test]
@@ -607,6 +623,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_generate_aes_key_and_encrypt_decrypt() {
         let ctx = Context::new(get_test_tcti()).expect("Failed to create TPM context");
         let mut tpm_handle = TpmManagerHandle::create_with_primary(ctx).unwrap();
@@ -617,7 +634,7 @@ mod tests {
             .unwrap();
 
         // Export blobs and reload the key to test load_aes_key
-        // let (_pub_blob, _priv_blob) = export_key_material_blobs(&public, &private).unwrap(); // Blobs not directly used by load_aes_key current signature
+        let (_pub_blob, _priv_blob) = export_key_material_blobs(&public, &private).unwrap(); // Blobs not directly used by load_aes_key current signature
 
         // Load the key using the *same* TpmManagerHandle.
         // This ensures the primary key is known in the context.
@@ -639,6 +656,8 @@ mod tests {
         let decrypted = tpm_handle // Use the original tpm_handle
             .aes_decrypt(&ciphertext, iv, SymmetricMode::Cfb) // Pass the mode
             .expect("AES Decryption failed");
+
+        println!("Decrypted data: {:?}", String::from_utf8_lossy(&decrypted));
         assert_eq!(decrypted, plaintext);
 
         // Test with the original handle as well
@@ -655,20 +674,58 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_export_key_material_blobs() {
-        let ctx = Context::new(get_test_tcti()).unwrap();
-        let mut tpm_handle = TpmManagerHandle::create_with_primary(ctx).unwrap();
-        let (_aes_handle, public, private) = tpm_handle
+        let ctx_orig = Context::new(get_test_tcti()).unwrap();
+        let mut tpm_handle_orig = TpmManagerHandle::create_with_primary(ctx_orig).unwrap();
+        let (_aes_handle, public_orig, private_orig) = tpm_handle_orig
             .generate_aes_key(AesKeyBits::Aes128, SymmetricMode::Cbc)
             .unwrap();
-        let (pub_blob, priv_blob) = export_key_material_blobs(&public, &private).unwrap();
+        let (pub_blob, priv_blob) = export_key_material_blobs(&public_orig, &private_orig).unwrap();
         assert!(!pub_blob.is_empty());
         assert!(!priv_blob.is_empty());
 
-        // Optional: Try to unmarshall and verify
-        let unmarshalled_public = Public::unmarshall(&pub_blob).unwrap();
-        assert_eq!(public, unmarshalled_public);
-        // let unmarshalled_private =
-        // assert_eq!(private, unmarshalled_private);
+        // Unmarshall and verify
+        let unmarshalled_public =
+            Public::unmarshall(&pub_blob).expect("Failed to unmarshal public key blob");
+        let unmarshalled_private =
+            Private::try_from(priv_blob.clone()).expect("Failed to create Private from blob"); // Use .clone() if priv_blob is used later, though not strictly necessary here.
+        assert_eq!(
+            public_orig, unmarshalled_public,
+            "Unmarshalled public key does not match original"
+        );
+        assert_eq!(
+            private_orig, unmarshalled_private,
+            "Unmarshalled private key does not match original"
+        );
+
+        drop(tpm_handle_orig); // Ensure the original handle and its context are dropped
+
+        // Create a new TpmManagerHandle with a new context to simulate loading in a new session/application instance
+        let ctx_new = Context::new(get_test_tcti()).unwrap();
+        let mut tpm_handle_loaded_key = TpmManagerHandle::create_with_primary(ctx_new).unwrap();
+
+        // Load the unmarshalled key into the new handle
+        let _loaded_key_object_handle = tpm_handle_loaded_key
+            .load_aes_key(unmarshalled_public, unmarshalled_private) // Pass the unmarshalled Public and Private structs
+            .expect("Failed to load exported/unmarshalled AES key into new handle");
+
+        // Encrypt-decrypt test using the new handle with the loaded key
+        let plaintext = b"test export key material with loaded key";
+        let (ciphertext, iv) = tpm_handle_loaded_key
+            .aes_encrypt(plaintext, SymmetricMode::Cbc)
+            .expect("AES Encryption failed using the loaded key");
+        assert_ne!(
+            ciphertext, plaintext,
+            "Ciphertext should not be same as plaintext"
+        );
+
+        let decrypted_text = tpm_handle_loaded_key
+            .aes_decrypt(&ciphertext, iv, SymmetricMode::Cbc)
+            .expect("AES Decryption failed using the loaded key");
+        assert_eq!(
+            decrypted_text, plaintext,
+            "Decrypted text does not match original plaintext after loading key"
+        );
     }
 }

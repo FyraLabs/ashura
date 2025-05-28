@@ -8,6 +8,9 @@ repository = "https://github.com/FyraLabs/ashura"
 authors = ["Cappy Ishihara <cappy@fyralabs.com>"]
 keywords = ["tpm", "kv", "secret", "storage"]
 
+[profile.test]
+test-threads = 1
+
 [workspace]
 members = ["crates/tpm2-rand", "frontend/"]
 
@@ -26,3 +29,5 @@ tracing = "0.1.41"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+serial_test = "*"
+tracing-test = "0.2.5"

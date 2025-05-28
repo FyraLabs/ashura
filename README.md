@@ -42,6 +42,13 @@ To enhance security, additional inputs (e.g., a user-provided password, salt, or
 +-----------------------+            +---------------------+
 ```
 
+## Requirements
+
+- A Trusted Platform Module (TPM) 2.0 compliant device with `EncryptDecrypt2` and AES-128-CFB support. (Support for RSA is incomplete, planned)
+- A Linux environment with the `tpm2-tss` libraries installed.
+- UEFI boot to allow TPM access.
+- Somewhere on the disk to store the encrypted secrets database (e.g., `~/.local/share/ashura`).
+
 ## Contributing
 
 Ashura is currently in an early planning and development phase. We welcome suggestions and contributions to help shape its architecture and processes, as these are still evolving and not yet finalized. Your input is highly valued. We also encourage contributions to the codebase, documentation, and testing. Feel free to open an issue to discuss ideas or submit a pull request.

@@ -14,7 +14,7 @@ use zeroize::Zeroize;
 /// This key should be protected with the highest level of security, as compromise
 /// of the master key would allow an attacker to derive all session keys.
 ///
-/// In TPM terms, this is considered the Storage Root Key (SRK).
+/// In TPM terms, this is considered the Content Encryption Key (CEK).
 pub struct MasterKey {
     key: SecretSlice<u8>,
 }
