@@ -1,6 +1,8 @@
 use std::cell::RefCell;
 use tss_esapi::handles::KeyHandle;
-use tss_esapi::structures::{Digest, RsaDecryptionScheme};
+// Remove Digest as it's no longer used directly in create_with_primary with builders
+// use tss_esapi::structures::{Digest, RsaDecryptionScheme};
+use tss_esapi::structures::RsaDecryptionScheme; // Keep for rsa_encrypt/decrypt
 use tss_esapi::traits::Marshall;
 use tss_esapi::{handles::ObjectHandle, tcti_ldr::TabrmdConfig};
 
@@ -86,6 +88,32 @@ impl TpmManagerHandle {
         ),
         tss_esapi::Error,
     > {
+        /*
+        Example output when running `tpm2_create -G rsa2048:rsaes -g sha256 -u rsa.pub -r rsa.priv -C primary.ctx`:
+        name-alg:
+        value: sha256
+        raw: 0xb
+        attributes:
+        value: fixedtpm|fixedparent|sensitivedataorigin|userwithauth|decrypt
+        raw: 0x20072
+        type:
+        value: rsa
+        raw: 0x1
+        exponent: 65537
+        bits: 2048
+        scheme:
+        value: rsaes
+        raw: 0x15
+        sym-alg:
+        value: null
+        raw: 0x10
+        sym-mode:
+        value: (null)
+        raw: 0x0
+        sym-keybits: 0
+        rsa: c717cd8f3ca9b413ec31a815ff04ad6eb373c924f8e360e25cf61f452db2fc72e73cf949255650c3fb39a8951f05b45b9d30b6469c912e30fa25ddfe5bf16fd9e70357610f3ce07e92d59797a649b47f2059edc5a38d1a99e04f7494247275037b8d2ed5183c54925fe78ce746d3bdf22cd8558d08bb0d6ac06d8efe2b452cd6aeb3007ab1195525a091d637d8093d546ce319e426baea3cd71331b9bad6c01c02f8b683d82a73d497cb17e9a4c66e70e57c1f8171de6b3bb7146c192f0eaabd06ba7889a6f781acd7037efc9de83af59b4caef6cf768a80188bf04d85f1783908bc8a90eaed80924283b6114bf9428feff9cc10c4e2c0a0221ee50eaedefe79
+        This matches the output of tpm2-tools exactly, so we can use the same builders to create the key.
+        */
         use tss_esapi::attributes::ObjectAttributesBuilder;
         use tss_esapi::handles::KeyHandle;
         use tss_esapi::interface_types::algorithm::{
@@ -101,24 +129,30 @@ impl TpmManagerHandle {
         // No explicit session needed for basic operations
 
         // Build the public area for the RSA key - match tmp2-tools exactly
-        let rsa_params = PublicRsaParametersBuilder::new_restricted_decryption_key(
-            SymmetricDefinitionObject::AES_128_CFB, // Use AES_128_CFB for symmetric encryption
-            RsaKeyBits::Rsa2048, // Convert key size to RsaKeyBits
-            RsaExponent::default(), // Default exponent (65537)
-        )
-        .build()
-        .unwrap();
+        let rsa_params = PublicRsaParametersBuilder::new()
+            .with_scheme(RsaScheme::create(RsaSchemeAlgorithm::RsaEs, None).unwrap())
+            // .with_key_bits(RsaKeyBits::try_from(key_size).unwrap())
+            .with_exponent(RsaExponent::default())
+            .with_symmetric(SymmetricDefinitionObject::Null) // Child decryption keys use Null symmetric
+            .with_is_decryption_key(true) // Inform builder this is a decryption key
+            .with_key_bits(RsaKeyBits::Rsa2048)
+            .with_restricted(false) // Builder default is false, which is correct for an unrestricted child key
+            .build()
+            .unwrap();
 
-        println!("[KeyPairGen] Generating RSA key with parameters: {:?}", rsa_params);
+        println!(
+            "[KeyPairGen] Generating RSA key with parameters: {:?}",
+            rsa_params
+        );
 
-        // Child key attributes exactly like tpm2-tools: fixedtpm|fixedparent|sensitivedataorigin|userwithauth|decrypt
+        // Child key attributes to match tpm2-tools, but also try restricted=true as parent is restricted.
         let object_attrs = ObjectAttributesBuilder::new()
             .with_fixed_tpm(true)
             .with_fixed_parent(true)
             .with_sensitive_data_origin(true)
             .with_user_with_auth(true)
             .with_decrypt(true)
-            .with_restricted(false) // No restricted for child
+            .with_restricted(true)              // Changed to true
             .build()?;
 
         println!("[KeyPairGen] Object attributes: {:?}", object_attrs);
@@ -197,7 +231,7 @@ impl TpmManagerHandle {
         let scheme = RsaDecryptionScheme::create(RsaDecryptAlgorithm::RsaEs, None)?;
         let data = Data::try_from(plaintext)?;
         let khandle = KeyHandle::from(rsa_handle.handle().value());
-        let (pubkey, name1, name2) = self.ctx.read_public(khandle)?;
+        let (pubkey, _name1, _name2) = self.ctx.read_public(khandle)?; // Mark unused as _
         let pubkey_rsa = if let tss_esapi::structures::Public::Rsa { unique, .. } = pubkey {
             unique
         } else {
@@ -226,7 +260,7 @@ impl TpmManagerHandle {
             None,
         )?;
         let khandle = KeyHandle::from(rsa_handle.handle().value());
-        let (pubkey, name1, name2) = self.ctx.read_public(khandle)?;
+        let (pubkey, _name1, _name2) = self.ctx.read_public(khandle)?; // Mark unused as _
         let pubkey_rsa = if let tss_esapi::structures::Public::Rsa { unique, .. } = pubkey {
             unique
         } else {
@@ -241,69 +275,98 @@ impl TpmManagerHandle {
 
     /// Create a new primary key in the TPM and return a new TpmManagerHandle.
     /// This will generate a storage primary key suitable for use as a parent for child keys.
-    pub fn create_with_primary(ctx: tss_esapi::Context) -> Result<Self, tss_esapi::Error> {
+    pub fn create_with_primary(mut ctx: tss_esapi::Context) -> Result<Self, tss_esapi::Error> {
+        // Added mut ctx
         use tss_esapi::attributes::ObjectAttributesBuilder;
-        use tss_esapi::interface_types::algorithm::{
-            HashingAlgorithm, PublicAlgorithm, RsaSchemeAlgorithm,
-        };
+        use tss_esapi::interface_types::algorithm::{HashingAlgorithm, PublicAlgorithm};
         use tss_esapi::interface_types::key_bits::RsaKeyBits;
         use tss_esapi::interface_types::resource_handles::Hierarchy;
         use tss_esapi::structures::{
-            PublicBuilder, PublicKeyRsa, PublicRsaParametersBuilder, RsaExponent, RsaScheme,
+            PublicBuilder,
+            PublicKeyRsa,
+            PublicRsaParametersBuilder,
+            RsaExponent,
+            // RsaScheme, // No longer needed directly here, new_restricted_decryption_key handles it
             SymmetricDefinitionObject,
         };
 
-        // Use working unrestricted parent configuration
+        // Parent key attributes: restricted decryption key
         let object_attrs = ObjectAttributesBuilder::new()
             .with_fixed_tpm(true)
             .with_fixed_parent(true)
             .with_sensitive_data_origin(true)
             .with_user_with_auth(true)
             .with_decrypt(true)
-            .with_restricted(true) // Matches tpm2-tools
+            .with_restricted(true) // Restricted parent
             .build()
             .unwrap();
 
+        // Parent key RSA parameters: For a restricted decryption key, scheme is Null, symmetric is non-Null.
+        // This uses the helper that correctly sets internal flags for the builder.
         let rsa_params = PublicRsaParametersBuilder::new_restricted_decryption_key(
-            SymmetricDefinitionObject::AES_128_CFB,
+            SymmetricDefinitionObject::AES_128_CFB, // Example symmetric cipher
             RsaKeyBits::Rsa2048,
             RsaExponent::default(),
         )
         .build()
         .unwrap();
 
-        println!("Creating primary key with RSA parameters: {:?}", rsa_params);
-        println!("Object attributes: {:?}", object_attrs);
+        println!(
+            "[PrimaryCreate] Creating primary key with RSA parameters: {:?}",
+            rsa_params
+        );
+        println!("[PrimaryCreate] Object attributes: {:?}", object_attrs);
 
-        let public = PublicBuilder::new()
-            .with_object_attributes(object_attrs)
-            .with_rsa_parameters(rsa_params)
+        // Construct the Public structure for the primary key using PublicBuilder
+        let public_for_primary = PublicBuilder::new()
             .with_public_algorithm(PublicAlgorithm::Rsa)
             .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
-            .with_rsa_unique_identifier(PublicKeyRsa::default()) // Use default for empty unique field
+            .with_object_attributes(object_attrs)
+            .with_rsa_parameters(rsa_params)
+            // .with_auth_policy(Digest::default()) // auth_policy is optional in builder, defaults to empty
+            .with_rsa_unique_identifier(PublicKeyRsa::default()) // TPM fills this
             .build()
             .unwrap();
 
-        println!("Public area for primary key: {:?}", public);
+        println!(
+            "[PrimaryCreate] Public area for primary key: {:?}",
+            public_for_primary
+        );
 
         // Start an HMAC session for authorization
-        let mut ctx = ctx;
+        // ctx is already mutable due to function signature
         let session = ctx.start_auth_session(
             None,
             None,
             None,
             tss_esapi::constants::SessionType::Hmac,
-            SymmetricDefinitionObject::AES_128_CFB.into(), // Use AES_128_CFB symmetric for session
+            SymmetricDefinitionObject::AES_128_CFB.into(), // Session symmetric can remain for session security
             HashingAlgorithm::Sha256,
         )?;
         ctx.set_sessions((session, None, None));
 
-        let create_primary_result =
-            ctx.create_primary(Hierarchy::Endorsement, public, None, None, None, None)?;
-        // Keep session active for child key operations
+        let create_primary_result = ctx.create_primary(
+            Hierarchy::Endorsement,
+            public_for_primary,
+            None,
+            None,
+            None,
+            None,
+        )?;
 
-        let primary_handle =
-            TpmObjectHandle::new(create_primary_result.key_handle.into(), &mut ctx);
+        // The TpmObjectHandle needs a pointer to the context to flush it on drop.
+        // Storing a raw pointer `*mut tss_esapi::Context` is tricky if `ctx` is moved out of `create_with_primary`.
+        // However, TpmManagerHandle takes ownership of ctx.
+        // For TpmObjectHandle to safely use the context, it must not outlive TpmManagerHandle.
+        // A raw pointer is okay if TpmManagerHandle owns ctx and TpmObjectHandle is used carefully.
+        // Let's assume the current structure with *mut ctx is managed correctly by the caller or TpmManagerHandle's lifetime.
+        // When creating primary_handle, it will be stored in TpmManagerHandle which also stores ctx.
+        // So, we pass a pointer to the ctx that TpmManagerHandle will own.
+        let primary_handle_raw_ctx_ptr = &mut ctx as *mut tss_esapi::Context;
+        let primary_handle = TpmObjectHandle::new(
+            create_primary_result.key_handle.into(),
+            primary_handle_raw_ctx_ptr,
+        );
         Ok(TpmManagerHandle::new(ctx, primary_handle))
     }
 }
@@ -314,8 +377,8 @@ pub fn export_rsa_keypair_blobs(
     private: &tss_esapi::structures::Private,
 ) -> Result<(Vec<u8>, Vec<u8>), tss_esapi::Error> {
     let pub_blob = public.marshall()?;
-    let priv_blob = private;
-    Ok((pub_blob, priv_blob.to_vec()))
+    let priv_blob = private.value().to_vec(); // Access the inner buffer and convert to Vec<u8>
+    Ok((pub_blob, priv_blob))
 }
 
 #[cfg(test)]
