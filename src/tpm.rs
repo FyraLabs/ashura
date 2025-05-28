@@ -275,7 +275,7 @@ impl TpmManagerHandle {
             message_data, // (corresponds to 'message' in TPM2_RSA_Encrypt - plaintext)
         );
 
-        // Restore original sessions
+        // Restore
         self.ctx.set_sessions(original_sessions);
 
         // Handle the result after restoring sessions
@@ -326,12 +326,12 @@ impl TpmManagerHandle {
         let object_attributes = ObjectAttributesBuilder::new()
             .with_fixed_tpm(true)
             .with_fixed_parent(true)
-            .with_st_clear(false) // Per example for AES key
+            .with_st_clear(true) // Changed to true to match example_aes_encryptdecrypt.rs for child key
             .with_sensitive_data_origin(true)
             .with_user_with_auth(true) // Allows use with null auth if authValue is empty
             .with_sign_encrypt(true) // For symmetric keys, enables encryption/decryption
             .with_decrypt(true)
-            .with_restricted(true) // Child key must be restricted if parent is restricted
+            .with_restricted(false)
             .build()?;
 
         let sym_def_obj = match (key_bits, mode) {
@@ -490,8 +490,9 @@ impl TpmManagerHandle {
             .with_st_clear(true) // Changed to true to match example_aes_encryptdecrypt.rs
             .with_sensitive_data_origin(true)
             .with_user_with_auth(true) // Allows use with null auth if authValue is empty
-            .with_decrypt(true) // Allows key to be used for decryption (relevant for restricted keys)
-            .with_restricted(true) // Restricted key: can only be parent to restricted keys or be used in specific ways
+            .with_decrypt(true) // Allows key to be used for decryption
+            // .with_sign_encrypt(true) // REMOVED: sign must be CLEAR for primary SymCipher keys
+            .with_restricted(true) // CHANGED: Primary key is restricted as per user finding
             .build()?;
 
         // Primary key symmetric parameters (e.g., AES_128_CFB as in example)
@@ -611,23 +612,16 @@ mod tests {
         let mut tpm_handle = TpmManagerHandle::create_with_primary(ctx).unwrap();
 
         // Generate an AES-128-CFB key (changed from Cbc for diagnostics)
-        let (aes_handle, public, private) = tpm_handle
+        let (_aes_handle_generated, public, private) = tpm_handle
             .generate_aes_key(AesKeyBits::Aes128, SymmetricMode::Cfb) // Changed to Cfb
             .unwrap();
 
         // Export blobs and reload the key to test load_aes_key
-        let (pub_blob, priv_blob) = export_key_material_blobs(&public, &private).unwrap();
+        // let (_pub_blob, _priv_blob) = export_key_material_blobs(&public, &private).unwrap(); // Blobs not directly used by load_aes_key current signature
 
-        // Create a new context for loading, or re-use if appropriate and state is managed
-        let load_ctx =
-            Context::new(get_test_tcti()).expect("Failed to create TPM context for load"); // mut removed
-        let mut load_tpm_handle =
-            TpmManagerHandle::new(load_ctx, tpm_handle.primary_handle().clone()); // Clone primary handle if it's just an ID
-
-        // To load the key, we need its public and private parts.
-        // The `Private` structure needs to be unmarshalled if we only have `priv_blob`.
-        // For this test, we have `public` and `private` structs directly.
-        let loaded_handle = load_tpm_handle
+        // Load the key using the *same* TpmManagerHandle.
+        // This ensures the primary key is known in the context.
+        let _loaded_handle = tpm_handle // Use the original tpm_handle
             .load_aes_key(public.clone(), private.clone())
             .expect("Failed to load AES key");
 
@@ -635,15 +629,15 @@ mod tests {
         // This might involve comparing properties or just ensuring load was successful.
         // For now, we trust load_aes_key sets the current_aes_handle correctly.
 
-        // Test encryption and decryption using the loaded key via load_tpm_handle
+        // Test encryption and decryption using the loaded key via tpm_handle
         let plaintext = b"hello AES TPM!";
-        let (ciphertext, iv) = load_tpm_handle
-            .aes_encrypt(plaintext, SymmetricMode::Cfb) // Mode must match key (Changed to Cfb)
+        let (ciphertext, iv) = tpm_handle // Use the original tpm_handle
+            .aes_encrypt(plaintext, SymmetricMode::Cfb) // Pass the mode
             .expect("AES Encryption failed");
         assert_ne!(ciphertext, plaintext);
 
-        let decrypted = load_tpm_handle
-            .aes_decrypt(&ciphertext, iv, SymmetricMode::Cfb) // Mode must match key (Changed to Cfb)
+        let decrypted = tpm_handle // Use the original tpm_handle
+            .aes_decrypt(&ciphertext, iv, SymmetricMode::Cfb) // Pass the mode
             .expect("AES Decryption failed");
         assert_eq!(decrypted, plaintext);
 
@@ -658,10 +652,6 @@ mod tests {
         assert_eq!(decrypted2, plaintext);
 
         // Silence unused variable warnings for test clarity if any remain
-        let _ = aes_handle;
-        let _ = pub_blob;
-        let _ = priv_blob;
-        let _ = loaded_handle;
     }
 
     #[test]
