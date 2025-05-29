@@ -303,9 +303,11 @@ impl Secret {
     /// ```rust,no_run
     /// use ashura::secret::Secret;
     /// use ashura::SessionKey;
-    ///
+    /// 
     /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let session_key = SessionKey::new(Default::default(), None, &[0u8; 32]);
+    /// # // Don't actually do this in prod
+    /// # let master_key = ashura::MasterKey::from_slice(&[0u8; 32]);
+    /// # let session_key = SessionKey::new(master_key, None, &[0u8; 32]);
     /// # let secret = Secret::from_plaintext_blank(vec![1,2,3], session_key.clone(), vec![0u8; 32]);
     /// // Decrypt with explicit nonce
     /// let (plaintext, updated_secret) = secret.decrypt(&session_key, 1)?;
