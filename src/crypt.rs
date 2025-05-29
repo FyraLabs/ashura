@@ -2,9 +2,7 @@ use aes_gcm::{Aes256Gcm, aead::KeyInit};
 use hkdf::Hkdf;
 use secrecy::{ExposeSecret, SecretSlice};
 use tss_esapi::Context as TpmContext;
-use zeroize::Zeroize;
-
-use crate::tpm::SealedMasterKey;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A struct containing the master key,
 /// which can then be used to derive other keys from.
@@ -33,27 +31,18 @@ impl MasterKey {
         }
     }
 
+    pub fn from_slice(key: &[u8]) -> Self {
+        if key.len() != 32 {
+            panic!("MasterKey must be 32 bytes long");
+        }
+        Self {
+            key: SecretSlice::new(key.to_vec().into()),
+        }
+    }
+
     pub fn key(&self) -> &SecretSlice<u8> {
         &self.key
     }
-
-    pub fn unseal(self, tpm_context: TpmContext) -> Result<SealedMasterKey, tss_esapi::Error> {
-        // This method is intended to unseal the master key from the TPM.
-        // It will use the TPM context to perform the unsealing operation.
-        // The actual implementation will depend on the TPM's capabilities
-        // and the specific sealing mechanism used.
-        // SealedMasterKey::decrypt(self.key.expose_secret(), tpm_context)
-        //     .map_err(|e| e.into())
-        unimplemented!()
-    }
-
-    // pub fn decrypt(ciphertxt: &[u8], tpm_context: crate::tpm::TpmManagerHandle) -> Self {
-    //     todo!("Implement unsealing logic")
-    // }
-
-    // pub fn encrypt(&self, tpm_context: crate::tpm::TpmManagerHandle) -> Vec<u8> {
-    //     todo!("Implement sealing logic")
-    // }
 }
 
 impl Zeroize for MasterKey {
@@ -61,6 +50,8 @@ impl Zeroize for MasterKey {
         self.key.zeroize();
     }
 }
+
+impl ZeroizeOnDrop for MasterKey {}
 
 impl Drop for MasterKey {
     fn drop(&mut self) {
@@ -74,6 +65,7 @@ impl Drop for MasterKey {
 /// from a `MasterKey`. This key can be used for secure communication or
 /// encryption tasks within a session. The key is stored securely using
 /// the `SecretSlice` type to ensure sensitive data is protected.
+#[derive(Clone, Debug)]
 pub struct SessionKey {
     key: SecretSlice<u8>,
 }
@@ -82,26 +74,63 @@ impl SessionKey {
     // The master key here is consumed for security reasons
     // todo: consider if consuming the master key is necessary
     pub fn new(master_key: MasterKey, starting_salt: Option<&[u8]>, salt: &[u8]) -> Self {
+        // Validate input: salt should not be empty for security
+        if salt.is_empty() {
+            panic!("Salt cannot be empty for key derivation");
+        }
+
         let mut key = [0u8; 32];
         let hkdf = Hkdf::<sha2::Sha256>::new(starting_salt, master_key.key().expose_secret());
         drop(master_key); // Explicit drop just to be extra sure
+
         hkdf.expand(salt, &mut key).expect("hkdf expansion failed");
-        Self {
+
+        let session_key = Self {
             key: SecretSlice::new(key.into()),
-        }
+        };
+
+        // Zeroize the intermediate key material for security
+        key.zeroize();
+
+        session_key
     }
 
     /// Further expand the derived key using HKDF
     pub fn expand(self, salt: &[u8]) -> Self {
+        // Validate input: salt should not be empty for security
+        if salt.is_empty() {
+            panic!("Salt cannot be empty for key derivation");
+        }
+
         let mut key = [0u8; 32];
         let hkdf = Hkdf::<sha2::Sha256>::new(None, self.key.expose_secret());
         hkdf.expand(salt, &mut key).expect("hkdf expansion failed");
-        Self {
+
+        let session_key = Self {
             key: SecretSlice::new(key.into()),
-        }
+        };
+
+        // Zeroize the intermediate key material for security
+        key.zeroize();
+
+        session_key
     }
 
     pub fn key(&self) -> &SecretSlice<u8> {
         &self.key
+    }
+}
+
+impl Zeroize for SessionKey {
+    fn zeroize(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for SessionKey {}
+
+impl Drop for SessionKey {
+    fn drop(&mut self) {
+        self.zeroize();
     }
 }

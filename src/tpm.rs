@@ -2,11 +2,13 @@
 // use std::cell::RefCell; // Unused
 use bincode::Decode;
 use bincode::Encode;
+use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde::Serialize;
 use std::convert::TryFrom;
 use tracing::trace;
 use tracing::{debug, error, info, instrument};
+use tss_esapi::traits::UnMarshall;
 // TryInto is unused
 use tss_esapi::attributes::ObjectAttributesBuilder;
 use tss_esapi::constants::AlgorithmIdentifier;
@@ -28,7 +30,9 @@ use tss_esapi::structures::{
     SymmetricDefinitionObject, // SensitiveData is unused
 };
 use tss_esapi::traits::Marshall;
-use tss_esapi::{Context, tcti_ldr::TabrmdConfig}; // Keep Context import
+use tss_esapi::{Context, tcti_ldr::TabrmdConfig};
+
+use crate::MasterKey; // Keep Context import
 
 pub fn default_tcti_handle() -> tss_esapi::TctiNameConf {
     tss_esapi::TctiNameConf::from_environment_variable()
@@ -38,7 +42,78 @@ pub fn default_tcti_handle() -> tss_esapi::TctiNameConf {
 #[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone)]
 pub struct SealedMasterKey {
     pub crypted_type: TpmEncryptionMeta,
-    pub key: KeySeal,
+    pub key_seal: KeySeal,
+    pub encrypted_key: Vec<u8>,
+}
+
+impl SealedMasterKey {
+    /// Creates a new `SealedMasterKey` with the given encryption metadata and key seal.
+    pub fn new(crypted_type: TpmEncryptionMeta, key_seal: KeySeal, encrypted_key: Vec<u8>) -> Self {
+        Self {
+            crypted_type,
+            key_seal,
+            encrypted_key,
+        }
+    }
+
+    pub fn decrypt(&self, tpm_context: Context) -> Result<MasterKey, tss_esapi::Error> {
+        // Decrypt the sealed master key using the TPM context
+        match &self.key_seal {
+            KeySeal::Blobs {
+                public_key,
+                private_key_blob,
+            } => {
+                let mut manager = TpmManagerHandle::new_with_primary_auto(tpm_context)?;
+
+                // Load the pub and priv keys
+                let public = Public::unmarshall(public_key)?;
+                let private = Private::try_from(private_key_blob.as_slice()).map_err(|_| {
+                    tss_esapi::Error::WrapperError(tss_esapi::WrapperErrorKind::InvalidParam)
+                })?;
+                manager.load_key(public, private).and_then(|_key_handle| {
+                    // Decrypt the master key using the loaded key
+                    let decrypted = manager.decrypt(&self.encrypted_key, &self.crypted_type)?;
+                    Ok(MasterKey::from_slice(decrypted.as_slice()))
+                })
+            }
+
+            KeySeal::TpmAddress { address } => {
+                let mut manager = TpmManagerHandle::new_without_primary(tpm_context);
+                // Create a TpmObjectHandle from the address
+                let _ = manager.load_key_from_persistent_address(*address);
+                // Decrypt the master key using the loaded key
+                let decrypted = manager.decrypt(&self.encrypted_key, &self.crypted_type)?;
+                Ok(MasterKey::from_slice(decrypted.as_slice()))
+            }
+        }
+    }
+
+    pub fn encrypt(
+        master_key: MasterKey,
+        tpm_context: Context,
+        persistent_address: Option<u32>,
+    ) -> Result<Self, tss_esapi::Error> {
+        // Encrypt the master key using the TPM context
+        let mut manager = TpmManagerHandle::new_with_primary_auto(tpm_context)?;
+
+        // Generate a new key pair for sealing
+        let (_key_handle, public, private) = manager.generate_keypair_auto()?;
+
+        // Encrypt the master key using the generated key
+        let (encrypted_key, crypted_type) = manager.encrypt(master_key.key().expose_secret())?;
+
+        // Determine the key seal type based on whether a persistent address is provided
+        let key_seal = if let Some(address) = persistent_address {
+            KeySeal::TpmAddress { address }
+        } else {
+            KeySeal::Blobs {
+                public_key: public.marshall()?,
+                private_key_blob: private.value().to_vec(),
+            }
+        };
+
+        Ok(SealedMasterKey::new(crypted_type, key_seal, encrypted_key))
+    }
 }
 
 #[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone)]
@@ -82,7 +157,7 @@ impl TpmObjectHandle {
 
 pub struct TpmManagerHandle {
     ctx: Context, // Assuming Context is directly held
-    primary_handle: KeyHandle,
+    primary_handle: Option<KeyHandle>,
     current_child_key_handle: Option<KeyHandle>, // Renamed from current_aes_handle
 }
 
@@ -163,8 +238,17 @@ impl TpmManagerHandle {
     pub fn new(ctx: Context, primary_handle: KeyHandle) -> Self {
         Self {
             ctx,
-            primary_handle,
+            primary_handle: Some(primary_handle),
             current_child_key_handle: None, // Renamed and initialized
+        }
+    }
+
+    /// Creates a new `TmpManagerHandle` with only context for working with persistent keys
+    pub fn new_without_primary(ctx: Context) -> Self {
+        Self {
+            ctx,
+            primary_handle: None,
+            current_child_key_handle: None,
         }
     }
 
@@ -192,16 +276,22 @@ impl TpmManagerHandle {
         ),
         tss_esapi::Error,
     > {
-        // Automatically determine the public algorithm based on the key size
-        let public_algorithm = self.get_key_type(self.primary_handle)?;
+        // Require a primary key for generating child keys
+        let primary = self.primary_handle.ok_or_else(|| {
+            error!("No primary key available for child key generation");
+            tss_esapi::Error::WrapperError(tss_esapi::WrapperErrorKind::ParamsMissing)
+        })?;
+
+        // Automatically determine the public algorithm based on the primary key
+        let public_algorithm = self.get_key_type(primary)?;
         match public_algorithm {
             PublicAlgorithm::Rsa => {
                 debug!("Generating RSA key pair under primary handle");
-                self.generate_rsa_key_pair(2048)
+                self.generate_rsa_child_key_pair(2048)
             }
             PublicAlgorithm::SymCipher => {
                 debug!("Generating AES key pair under primary handle");
-                self.generate_aes_key(
+                self.generate_aes_child_key(
                     tss_esapi::interface_types::key_bits::AesKeyBits::Aes128,
                     tss_esapi::interface_types::algorithm::SymmetricMode::Cfb,
                 )
@@ -222,8 +312,24 @@ impl TpmManagerHandle {
         &mut self,
         plaintext: &[u8],
     ) -> Result<(Vec<u8>, TpmEncryptionMeta), tss_esapi::Error> {
-        // Automatically determine the public algorithm based on the key size
-        let public_algorithm = self.get_key_type(self.primary_handle)?;
+        // Determine which key to use for encryption - prefer child key if available
+        let key_handle = match self.current_child_key_handle() {
+            Some(child_handle) => *child_handle,
+            None => match self.primary_handle {
+                Some(primary) => primary,
+                None => {
+                    error!(
+                        "No key available for encryption - neither primary nor child key loaded"
+                    );
+                    return Err(tss_esapi::Error::WrapperError(
+                        tss_esapi::WrapperErrorKind::ParamsMissing,
+                    ));
+                }
+            },
+        };
+
+        // Automatically determine the public algorithm based on the key
+        let public_algorithm = self.get_key_type(key_handle)?;
         match public_algorithm {
             PublicAlgorithm::Rsa => {
                 debug!("Encrypting data using RSA key");
@@ -279,9 +385,9 @@ impl TpmManagerHandle {
         }
     }
 
-    /// Returns a reference to the primary TPM object handle.
-    pub fn primary_handle(&self) -> &KeyHandle {
-        &self.primary_handle
+    /// Returns a reference to the primary TPM object handle if available.
+    pub fn primary_handle(&self) -> Option<&KeyHandle> {
+        self.primary_handle.as_ref()
     }
 
     /// Sets the child key handle, replacing any existing one.
@@ -299,7 +405,7 @@ impl TpmManagerHandle {
     /// Generate RSA key pair in the TPM and store it in the context.
     /// Returns the TPM object handle and the public/private blobs.
     #[instrument(level = "debug", skip(self))]
-    pub fn generate_rsa_key_pair(
+    pub fn generate_rsa_child_key_pair(
         &mut self,
         key_size: u16,
     ) -> Result<
@@ -328,7 +434,7 @@ impl TpmManagerHandle {
         // For encryption/decryption keys, we need to use a NULL scheme to allow the TPM
         // to infer the scheme from the encryption/decryption call
         let rsa_params = PublicRsaParametersBuilder::new()
-            .with_scheme(RsaScheme::RsaEs) // NULL scheme allows any scheme to be used
+            .with_scheme(RsaScheme::Null) // NULL scheme allows any scheme to be used
             .with_key_bits(RsaKeyBits::try_from(key_size)?)
             .with_exponent(RsaExponent::default())
             .with_symmetric(SymmetricDefinitionObject::Null) // No symmetric for unrestricted keys
@@ -371,10 +477,16 @@ impl TpmManagerHandle {
 
         let sensitive = SensitiveData::default();
 
+        // Require a primary key for generating child keys
+        let primary = self.primary_handle.ok_or_else(|| {
+            error!("No primary key available for RSA child key generation");
+            tss_esapi::Error::WrapperError(tss_esapi::WrapperErrorKind::ParamsMissing)
+        })?;
+
         // Create the key under the primary handle using a null auth session
         let create_result = self.ctx.execute_with_nullauth_session(|ctx| {
             ctx.create(
-                self.primary_handle,
+                primary,
                 public.clone(),
                 None, // authValue for the new key (empty)
                 Some(sensitive),
@@ -390,11 +502,13 @@ impl TpmManagerHandle {
         );
 
         // Load the key into the TPM using a null auth session
-        let key_handle = self.ctx.load(
-            self.primary_handle,
-            create_result.out_private.clone(),
-            create_result.out_public.clone(),
-        )?;
+        let key_handle = self.ctx.execute_with_nullauth_session(|ctx| {
+            ctx.load(
+                primary,
+                create_result.out_private.clone(),
+                create_result.out_public.clone(),
+            )
+        })?;
 
         self.set_child_key_handle(key_handle); // Renamed method
         Ok((
@@ -410,7 +524,15 @@ impl TpmManagerHandle {
         public: tss_esapi::structures::Public,
         private: tss_esapi::structures::Private,
     ) -> Result<KeyHandle, tss_esapi::Error> {
-        let key_handle = self.ctx.load(self.primary_handle, private, public)?;
+        // Require a primary key for loading child keys
+        let primary = self.primary_handle.ok_or_else(|| {
+            error!("No primary key available for loading child key");
+            tss_esapi::Error::WrapperError(tss_esapi::WrapperErrorKind::ParamsMissing)
+        })?;
+
+        let key_handle = self
+            .ctx
+            .execute_with_nullauth_session(|ctx| ctx.load(primary, private, public))?;
 
         self.set_child_key_handle(key_handle); // Renamed method
         Ok(key_handle)
@@ -425,7 +547,7 @@ impl TpmManagerHandle {
         // Check if the plaintext is too large for RSA encryption
         // For all RSA key sizes, we'll use a conservative limit of 100 bytes
         // which should work with 2048-bit RSA keys (max ~214 bytes)
-        if plaintext.len() > 100 {
+        if plaintext.len() > 190 {
             debug!(
                 "Plaintext too large for RSA encryption, length: {}",
                 plaintext.len()
@@ -502,7 +624,7 @@ impl TpmManagerHandle {
     }
 
     /// Generates a new AES key in the TPM under the primary key.
-    pub fn generate_aes_key(
+    pub fn generate_aes_child_key(
         &mut self,
         key_bits: tss_esapi::interface_types::key_bits::AesKeyBits,
         mode: tss_esapi::interface_types::algorithm::SymmetricMode,
@@ -531,9 +653,15 @@ impl TpmManagerHandle {
             .with_symmetric_cipher_unique_identifier(Digest::default()) // For symmetric keys
             .build()?;
 
+        // Require a primary key for generating child keys
+        let primary = self.primary_handle.ok_or_else(|| {
+            error!("No primary key available for AES child key generation");
+            tss_esapi::Error::WrapperError(tss_esapi::WrapperErrorKind::ParamsMissing)
+        })?;
+
         let (created_private, created_public) = self.ctx.execute_with_nullauth_session(|ctx| {
             ctx.create(
-                self.primary_handle,
+                primary,
                 key_public_template.clone(),
                 None, // authValue for the new key (empty)
                 None, // initialData
@@ -544,11 +672,7 @@ impl TpmManagerHandle {
         })?;
 
         let loaded_key_handle = self.ctx.execute_with_nullauth_session(|ctx| {
-            ctx.load(
-                self.primary_handle,
-                created_private.clone(),
-                created_public.clone(),
-            )
+            ctx.load(primary, created_private.clone(), created_public.clone())
         })?;
 
         self.set_child_key_handle(loaded_key_handle);
@@ -556,18 +680,24 @@ impl TpmManagerHandle {
         Ok((loaded_key_handle, created_public, created_private))
     }
 
-    /// Loads an existing AES key into the TPM under the current primary key.
-    pub fn load_aes_key(
-        &mut self,
-        public: Public,
-        private: Private,
-    ) -> Result<KeyHandle, tss_esapi::Error> {
-        let key_handle = self
-            .ctx
-            .execute_with_nullauth_session(|ctx| ctx.load(self.primary_handle, private, public))?;
-        self.set_child_key_handle(key_handle);
-        Ok(key_handle)
-    }
+    // /// Loads an existing AES key into the TPM under the current primary key.
+    // pub fn load_aes_key(
+    //     &mut self,
+    //     public: Public,
+    //     private: Private,
+    // ) -> Result<KeyHandle, tss_esapi::Error> {
+    //     // Require a primary key for loading child keys
+    //     let primary = self.primary_handle.ok_or_else(|| {
+    //         error!("No primary key available for loading AES child key");
+    //         tss_esapi::Error::WrapperError(tss_esapi::WrapperErrorKind::ParamsMissing)
+    //     })?;
+
+    //     let key_handle = self
+    //         .ctx
+    //         .execute_with_nullauth_session(|ctx| ctx.load(primary, private, public))?;
+    //     self.set_child_key_handle(key_handle);
+    //     Ok(key_handle)
+    // }
 
     pub fn get_key_type(
         &mut self,
@@ -812,7 +942,6 @@ impl TpmManagerHandle {
         })?;
         // Now the session is dropped, return the persistent handle as ObjectHandle
         Ok(result)
-
     }
 
     /// Loads a key from a persistent address in the TPM
@@ -820,7 +949,6 @@ impl TpmManagerHandle {
         &mut self,
         persistent_handle_value: u32,
     ) -> Result<KeyHandle, tss_esapi::Error> {
-
         // Convert to KeyHandle type and set as current child key
         let key_handle = KeyHandle::from(persistent_handle_value);
         self.set_child_key_handle(key_handle);
@@ -905,6 +1033,7 @@ fn pkcs7_unpad(data: &[u8]) -> Result<Vec<u8>, tss_esapi::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret;
     use serial_test::serial;
     use tracing_test::traced_test;
     use tss_esapi::{
@@ -925,10 +1054,10 @@ mod tests {
     fn test_tpm_object_handle() {
         let ctx = Context::new(get_test_tcti()).unwrap(); // mut removed
         let primary_handle = TpmObjectHandle::new(ObjectHandle::from(0x81010001));
-        let tpm_handle =
+        let tmp_handle =
             TpmManagerHandle::new(ctx, KeyHandle::from(primary_handle.handle().value()));
 
-        assert_eq!(tpm_handle.primary_handle().value(), 0x81010001);
+        assert_eq!(tmp_handle.primary_handle().unwrap().value(), 0x81010001);
     }
 
     #[test]
@@ -939,12 +1068,12 @@ mod tests {
 
         // Generate an AES-128-CFB key
         let (_aes_handle_generated, public, private) = tpm_handle
-            .generate_aes_key(AesKeyBits::Aes128, SymmetricMode::Cfb)
+            .generate_aes_child_key(AesKeyBits::Aes128, SymmetricMode::Cfb)
             .expect("AES key generation failed");
 
         // Load the key using the *same* TpmManagerHandle.
         let _loaded_handle = tpm_handle
-            .load_aes_key(public, private)
+            .load_key(public, private)
             .expect("AES key loading failed");
 
         // Test encryption and decryption using the loaded key via tpm_handle
@@ -971,7 +1100,7 @@ mod tests {
 
         // Generate an RSA key under the RSA primary
         let (_rsa_key_handle, _rsa_public, _rsa_private) = tpm_handle
-            .generate_rsa_key_pair(2048)
+            .generate_rsa_child_key_pair(2048)
             .expect("Failed to generate RSA key pair");
 
         // Test encryption and decryption
@@ -987,6 +1116,24 @@ mod tests {
             decrypted, plaintext,
             "Decrypted text should match original plaintext"
         );
+
+        // Create a new Context for MasterKey::generate since the original ctx was moved
+        let ctx_for_master_key =
+            Context::new(get_test_tcti()).expect("Failed to create TPM context for MasterKey");
+        let master_key = crate::MasterKey::generate(ctx_for_master_key);
+        // test long string (i.e the actual CEK)
+        let long = master_key.key().expose_secret();
+        debug!("Data length: {}", long.len());
+        let long_ciphertext = tpm_handle
+            .rsa_encrypt(long)
+            .expect("RSA encryption of long data failed");
+        let long_decrypted = tpm_handle
+            .rsa_decrypt(&long_ciphertext)
+            .expect("RSA decryption of long data failed");
+        assert_eq!(
+            long_decrypted, long,
+            "Decrypted long data should match original long data"
+        );
     }
 
     #[test]
@@ -996,7 +1143,7 @@ mod tests {
         let ctx_orig = Context::new(get_test_tcti()).unwrap();
         let mut tpm_handle_orig = TpmManagerHandle::create_with_aes_primary(ctx_orig).unwrap();
         let (_aes_handle, public_orig, private_orig) = tpm_handle_orig
-            .generate_aes_key(AesKeyBits::Aes128, SymmetricMode::Cbc)
+            .generate_aes_child_key(AesKeyBits::Aes128, SymmetricMode::Cbc)
             .unwrap();
         let (pub_blob, priv_blob) = export_key_material_blobs(&public_orig, &private_orig).unwrap();
         assert!(!pub_blob.is_empty());
@@ -1024,7 +1171,7 @@ mod tests {
 
         // Load the unmarshalled key into the new handle
         let _loaded_key_object_handle = tpm_handle_loaded_key
-            .load_aes_key(unmarshalled_public, unmarshalled_private) // Pass the unmarshalled Public and Private structs
+            .load_key(unmarshalled_public, unmarshalled_private) // Pass the unmarshalled Public and Private structs
             .expect("Failed to load exported/unmarshalled AES key into new handle");
 
         // Encrypt-decrypt test using the new handle with the loaded key
@@ -1057,7 +1204,7 @@ mod tests {
 
         // Generate an RSA 2048 key pair under the AES primary key
         let (rsa_key_handle, rsa_public, _rsa_private) = tpm_handle
-            .generate_rsa_key_pair(2048)
+            .generate_rsa_child_key_pair(2048)
             .expect("RSA key generation under AES primary failed");
 
         assert!(
