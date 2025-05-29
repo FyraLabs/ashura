@@ -176,10 +176,11 @@ impl TpmManagerHandle {
         // Build the public area for the RSA key
         debug!("Generating RSA key with key size: {} bits", key_size);
 
-        // Create parameters for an unrestricted decryption key using RsaEs scheme
-        // For encryption/decryption keys, we need special configuration
+        // Create parameters for an unrestricted decryption key using NULL scheme
+        // For encryption/decryption keys, we need to use a NULL scheme to allow the TPM
+        // to infer the scheme from the encryption/decryption call
         let rsa_params = PublicRsaParametersBuilder::new()
-            .with_scheme(RsaScheme::RsaEs) // RsaEs for encryption/decryption
+            .with_scheme(RsaScheme::Null) // NULL scheme allows any scheme to be used
             .with_key_bits(RsaKeyBits::try_from(key_size)?)
             .with_exponent(RsaExponent::default())
             .with_symmetric(SymmetricDefinitionObject::Null) // No symmetric for unrestricted keys
@@ -281,7 +282,6 @@ impl TpmManagerHandle {
         use tss_esapi::structures::{Data, PublicKeyRsa};
 
         // Check if the plaintext is too large for RSA encryption
-        // For RSA keys, max data size depends on key size and padding scheme
         // For all RSA key sizes, we'll use a conservative limit of 100 bytes
         // which should work with 2048-bit RSA keys (max ~214 bytes)
         if plaintext.len() > 100 {
@@ -306,21 +306,21 @@ impl TpmManagerHandle {
         debug!("Using RSA scheme: {:?}", rsa_key_scheme);
 
         // Make sure plaintext is properly converted to TPM Data type
-        let message_data = Data::try_from(plaintext.to_vec())?;
+        let label_data = Data::default(); // Empty label for RSA encryption
         debug!(
             "Converted plaintext to Data, size: {}",
-            message_data.value().len()
+            label_data.value().len()
         );
 
-        // Empty label (for RSA OAEP, this matters, for RSA ES it doesn't)
-        let label = PublicKeyRsa::default();
+        // Empty label for RSA
+        let message = PublicKeyRsa::try_from(plaintext.to_vec())?;
         debug!("Using empty label for encryption");
 
         debug!("Executing RSA encryption with null auth session");
 
         // Execute the encryption operation with a null auth session
         let encrypted_data = self.ctx.execute_with_nullauth_session(|ctx| {
-            ctx.rsa_encrypt(khandle, label, rsa_key_scheme, message_data)
+            ctx.rsa_encrypt(khandle, message, rsa_key_scheme, label_data)
         })?;
 
         debug!(
