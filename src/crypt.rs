@@ -4,6 +4,8 @@ use secrecy::{ExposeSecret, SecretSlice};
 use tss_esapi::Context as TpmContext;
 use zeroize::Zeroize;
 
+use crate::tpm::SealedMasterKey;
+
 /// A struct containing the master key,
 /// which can then be used to derive other keys from.
 ///
@@ -35,13 +37,23 @@ impl MasterKey {
         &self.key
     }
 
-    pub fn unseal_from_ciphertxt(ciphertxt: &[u8], tpm_context: crate::tpm::TpmManagerHandle) -> Self {
-        todo!("Implement unsealing logic")
+    pub fn unseal(self, tpm_context: TpmContext) -> Result<SealedMasterKey, tss_esapi::Error> {
+        // This method is intended to unseal the master key from the TPM.
+        // It will use the TPM context to perform the unsealing operation.
+        // The actual implementation will depend on the TPM's capabilities
+        // and the specific sealing mechanism used.
+        // SealedMasterKey::decrypt(self.key.expose_secret(), tpm_context)
+        //     .map_err(|e| e.into())
+        unimplemented!()
     }
 
-    pub fn seal_to_ciphertext(&self, tpm_context: crate::tpm::TpmManagerHandle) -> Vec<u8> {
-        todo!("Implement sealing logic")
-    }
+    // pub fn decrypt(ciphertxt: &[u8], tpm_context: crate::tpm::TpmManagerHandle) -> Self {
+    //     todo!("Implement unsealing logic")
+    // }
+
+    // pub fn encrypt(&self, tpm_context: crate::tpm::TpmManagerHandle) -> Vec<u8> {
+    //     todo!("Implement sealing logic")
+    // }
 }
 
 impl Zeroize for MasterKey {

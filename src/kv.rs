@@ -9,40 +9,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::error;
 
+use crate::tpm::{SealedMasterKey, TpmEncryptionMeta};
+
 // The kv path is defined in this format, delimited by a slash
 // `<collection_name>/secret/<secret_name>`
 // Each secret is stored in a collection prefix, then the secret label itself.
 // There's also additional data for the collection itself, which will have these paths:
 // `<collection_name>/sealed_master_key`
 // ... for TPM-sealed master keys
-
-#[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone, Default)]
-pub enum AesSymmetricMode {
-    #[default]
-    Cbc,
-    Ctr,
-    Ofb,
-    Cfb,
-    Ecb,
-}
-
-#[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone)]
-pub enum TpmEncryptionType {
-    /// An AES-128 CFB encryption type (default)
-    Aes128Cfb {
-        iv: Vec<u8>,
-        symmetric_mode: AesSymmetricMode,
-    },
-    /// RSA 2048-bit encryption type
-    Rsa2048,
-}
-
-#[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone)]
-pub struct SealedMasterKey {
-    pub crypted_type: TpmEncryptionType,
-    pub public_key: Vec<u8>,
-    pub private_key_blob: Vec<u8>,
-}
 
 /// A struct representing the main key-value store.
 /// A wrapper around sled's `Db` type.
