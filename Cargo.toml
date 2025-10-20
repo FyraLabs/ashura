@@ -8,15 +8,15 @@ authors = ["Cappy Ishihara <cappy@fyralabs.com>"]
 
 [workspace]
 members = [
-    "crates/rand-tpm2"
+    "crates/tpm2-rand"
 ]
 
 [dependencies]
 bincode = { version = "2.0.1", features = ["serde"] }
 rand = "0.9.2"
 rand_pcg = { version = "0.9.0", features = ["os_rng", "serde"] }
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.228", featrand-tpm2ures = ["derive"] }
 tss-esapi = "7.6.0"
-rand-tpm2 = { path = "crates/rand-tpm2" }
+rand-tpm2 = { path = "crates/tpm2-rand" }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tracing = "0.1.41"

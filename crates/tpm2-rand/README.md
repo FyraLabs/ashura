@@ -1,4 +1,4 @@
-# rand-tpm2
+# tpm2-rand
 
 This crate provides a simple `rand` generator that uses a TPM2 device to generate random numbers. It implements the `rand_core::TryRngCore` and `TryCryptoRng` trait, allowing it to be used seamlessly with the `rand` ecosystem.
 
