@@ -1,5 +1,5 @@
 [package]
-name = "tpm2-rand"
+name = "rand-tpm2"
 version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -10,4 +10,5 @@ categories = ["api-bindings", "hardware-support", "os"]
 
 [dependencies]
 rand_core = "0"
+tracing = "0.1.41"
 tss-esapi = ">=7"
