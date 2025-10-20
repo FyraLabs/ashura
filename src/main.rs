@@ -11,13 +11,13 @@ fn main() {
         .init();
     tracing::trace!("meow");
     let mut rng = TpmRand::new(context);
-    // loop {
-    let mut buf = [0u8; 100];
+    loop {
+        let mut buf = [0u8; 100];
 
-    rng.try_fill_bytes(&mut buf)
-        .expect("Failed to get random bytes from TPM");
-    println!("{:?}", buf);
-    let len = buf.len();
-    println!("Length of random bytes: {}", len);
-    // }
+        rng.try_fill_bytes(&mut buf)
+            .expect("Failed to get random bytes from TPM");
+        println!("{:?}", buf);
+        let len = buf.len();
+        println!("Length of random bytes: {}", len);
+    }
 }
