@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Cappy Ishihara <cappy@fyralabs.com>"]
 description = "A simple TPM2-based random number generator"
-repository = "https://github.com/FyraLabs/ashura/tree/main/crates/tpm2-rand"
+repository = "https://github.com/FyraLabs/ashura"
 categories = ["api-bindings", "hardware-support", "os"]
 
 [dependencies]
